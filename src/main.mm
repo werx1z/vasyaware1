@@ -1,47 +1,174 @@
-// main.mm — v4 с логированием OpenGL-функций
+// main.mm — Vasyaware с хуком на presentDrawable:
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 #import <mach-o/dyld.h>
 #import <mach/mach.h>
 #import <UIKit/UIKit.h>
-#import <OpenGLES/ES2/gl.h>
-#import <OpenGLES/ES2/glext.h>
+#import <Metal/Metal.h>
+#import <QuartzCore/CAMetalLayer.h>
 #import "substrate.h"
 
+extern BOOL menuVisible;
+extern BOOL bhopEnabled;
+extern BOOL kickBypassEnabled;
+
+void SetupImGui(void);
+void RenderMenu(id<MTLCommandBuffer> commandBuffer, id<MTLRenderCommandEncoder> encoder);
+void SetupMenuGesture(void);
 void WriteLog(NSString *message);
 
+// RVA из дампа UnityFramework
+#define RVA_DAMAGE_RPC          0x3d86f64
+#define RVA_CAN_JUMP            0x3d89c34
+#define RVA_CHEATER             0x3d8c534
+#define RVA_MOVE                0x3d854b0
+
+uintptr_t unityFramework = 0;
+
 // =================================================================
-// ХУКИ НА OPENGL ФУНКЦИИ
+// ОЖИДАНИЕ UNITYFRAMEWORK
 // =================================================================
 
-static int glDrawArraysCount = 0;
-static void (*orig_glDrawArrays)(GLenum, GLint, GLsizei);
-static void hooked_glDrawArrays(GLenum mode, GLint first, GLsizei count) {
-    glDrawArraysCount++;
-    if (glDrawArraysCount % 100 == 0) {
-        WriteLog([NSString stringWithFormat:@"glDrawArrays called %d times", glDrawArraysCount]);
+uintptr_t WaitForUnityFramework() {
+    WriteLog(@"Waiting for UnityFramework (max 60 seconds)...");
+    for (int attempt = 0; attempt < 600; attempt++) {
+        for (int i = 0; i < _dyld_image_count(); i++) {
+            const char *name = _dyld_get_image_name(i);
+            if (name && strstr(name, "UnityFramework")) {
+                WriteLog([NSString stringWithFormat:@"Found UnityFramework on attempt %d (%.1f sec): %s",
+                          attempt, (float)attempt / 10.0f, name]);
+                return (uintptr_t)_dyld_get_image_header(i);
+            }
+        }
+        if (attempt % 50 == 0 && attempt > 0) {
+            WriteLog([NSString stringWithFormat:@"Still waiting... (%.0f sec)", (float)attempt / 10.0f]);
+        }
+        usleep(100000);
     }
-    orig_glDrawArrays(mode, first, count);
+    WriteLog(@"UnityFramework NOT found after 60 seconds!");
+    return 0;
 }
 
-static int glDrawElementsCount = 0;
-static void (*orig_glDrawElements)(GLenum, GLsizei, GLenum, const void*);
-static void hooked_glDrawElements(GLenum mode, GLsizei count, GLenum type, const void* indices) {
-    glDrawElementsCount++;
-    if (glDrawElementsCount % 100 == 0) {
-        WriteLog([NSString stringWithFormat:@"glDrawElements called %d times", glDrawElementsCount]);
+// =================================================================
+// ХУК НА presentDrawable:
+// =================================================================
+
+static void (*orig_presentDrawable)(id, SEL, id<CAMetalDrawable>);
+static void hooked_presentDrawable(id self, SEL _cmd, id<CAMetalDrawable> drawable) {
+    // self = MTLCommandBuffer, drawable = CAMetalDrawable
+    
+    static BOOL imguiReady = NO;
+    if (!imguiReady) {
+        WriteLog(@"First presentDrawable - initializing ImGui");
+        SetupImGui();
+        imguiReady = YES;
     }
-    orig_glDrawElements(mode, count, type, indices);
+    
+    // Рисуем ImGui в тот же command buffer
+    if (menuVisible) {
+        id<MTLCommandBuffer> commandBuffer = (id<MTLCommandBuffer>)self;
+        
+        MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
+        pass.colorAttachments[0].texture = drawable.texture;
+        pass.colorAttachments[0].loadAction = MTLLoadActionLoad;
+        pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+        
+        id<MTLRenderCommandEncoder> encoder = [commandBuffer renderCommandEncoderWithDescriptor:pass];
+        RenderMenu(commandBuffer, encoder);
+        [encoder endEncoding];
+    }
+    
+    // Вызываем оригинал
+    if (orig_presentDrawable) {
+        orig_presentDrawable(self, _cmd, drawable);
+    }
 }
 
-static int glClearCount = 0;
-static void (*orig_glClear)(GLbitfield);
-static void hooked_glClear(GLbitfield mask) {
-    glClearCount++;
-    if (glClearCount % 100 == 0) {
-        WriteLog([NSString stringWithFormat:@"glClear called %d times", glClearCount]);
+// =================================================================
+// УСТАНОВКА ХУКА НА presentDrawable:
+// =================================================================
+
+void SetupMetalHook() {
+    Class cmdBufferClass = objc_getClass("MTLCommandBuffer");
+    if (!cmdBufferClass) {
+        WriteLog(@"MTLCommandBuffer class NOT found!");
+        return;
     }
-    orig_glClear(mask);
+    
+    // Ищем протокол MTLCommandBuffer (это протокол, не класс)
+    // Но реальные объекты имеют классы типа AGXCommandBuffer
+    const char* classes[] = {
+        "AGXCommandBuffer",
+        "AGXG13XFamilyCommandBuffer",
+        "AGXG14XFamilyCommandBuffer",
+        "AGXG15XFamilyCommandBuffer",
+        "MTLCommandBuffer",
+        "MTLDebugCommandBuffer"
+    };
+    
+    SEL selector = NSSelectorFromString(@"presentDrawable:");
+    
+    for (int i = 0; i < 6; i++) {
+        Class cls = objc_getClass(classes[i]);
+        if (!cls) continue;
+        
+        Method method = class_getInstanceMethod(cls, selector);
+        if (method) {
+            IMP imp = method_getImplementation(method);
+            orig_presentDrawable = (void*)imp;
+            method_setImplementation(method, (IMP)hooked_presentDrawable);
+            WriteLog([NSString stringWithFormat:@"Metal hook installed on %s", classes[i]]);
+            return;
+        }
+    }
+    WriteLog(@"Metal hook NOT installed");
+}
+
+// =================================================================
+// ХУКИ НА CharacterMotor
+// =================================================================
+
+static void (*orig_DamageRPC)(void*, float, int);
+static void hooked_DamageRPC(void* self, float dmg, int fromWhom) {
+    orig_DamageRPC(self, dmg, fromWhom);
+}
+
+static bool (*orig_CanJump)(void*);
+static bool hooked_CanJump(void* self) {
+    if (bhopEnabled) return true;
+    return orig_CanJump(self);
+}
+
+static bool (*orig_Cheater)(void*);
+static bool hooked_Cheater(void* self) {
+    if (kickBypassEnabled) return false;
+    return orig_Cheater(self);
+}
+
+static void (*orig_Move)(void*);
+static void hooked_Move(void* self) {
+    orig_Move(self);
+}
+
+void SetupHooks() {
+    unityFramework = WaitForUnityFramework();
+    if (!unityFramework) {
+        WriteLog(@"Cannot setup hooks - no UnityFramework");
+        return;
+    }
+    WriteLog([NSString stringWithFormat:@"UnityFramework base: 0x%lx", unityFramework]);
+
+    MSHookFunction((void*)(unityFramework + RVA_DAMAGE_RPC), (void*)hooked_DamageRPC, (void**)&orig_DamageRPC);
+    WriteLog(@"Hook: DamageRPC installed");
+
+    MSHookFunction((void*)(unityFramework + RVA_CAN_JUMP), (void*)hooked_CanJump, (void**)&orig_CanJump);
+    WriteLog(@"Hook: CanJump installed");
+
+    MSHookFunction((void*)(unityFramework + RVA_CHEATER), (void*)hooked_Cheater, (void**)&orig_Cheater);
+    WriteLog(@"Hook: Cheater installed");
+
+    MSHookFunction((void*)(unityFramework + RVA_MOVE), (void*)hooked_Move, (void**)&orig_Move);
+    WriteLog(@"Hook: Move installed");
 }
 
 // =================================================================
@@ -50,53 +177,30 @@ static void hooked_glClear(GLbitfield mask) {
 
 __attribute__((constructor)) static void init() {
     @autoreleasepool {
-        WriteLog(@"=== VASYWARE v4 + LOGS ===");
+        WriteLog(@"=== VASYWARE LOADING ===");
         [NSThread sleepForTimeInterval:3.0];
 
         // Логируем модули
         WriteLog(@"--- Loaded modules ---");
         for (int i = 0; i < _dyld_image_count(); i++) {
             const char *name = _dyld_get_image_name(i);
-            if (name && (strstr(name, "Chicken") || strstr(name, "Unity") || strstr(name, "OpenGL"))) {
+            if (name && (strstr(name, "Chicken") || strstr(name, "Unity"))) {
                 WriteLog([NSString stringWithFormat:@"Module: %s", name]);
             }
         }
         WriteLog(@"--- End modules ---");
 
-        // Ставим хуки на OpenGL
-        MSHookFunction((void*)glDrawArrays, (void*)hooked_glDrawArrays, (void**)&orig_glDrawArrays);
-        WriteLog(@"Hook: glDrawArrays installed");
+        // Устанавливаем Metal-хук
+        SetupMetalHook();
 
-        MSHookFunction((void*)glDrawElements, (void*)hooked_glDrawElements, (void**)&orig_glDrawElements);
-        WriteLog(@"Hook: glDrawElements installed");
+        // Ждём UnityFramework и ставим хуки
+        SetupHooks();
 
-        MSHookFunction((void*)glClear, (void*)hooked_glClear, (void**)&orig_glClear);
-        WriteLog(@"Hook: glClear installed");
+        // Жест
+        dispatch_async(dispatch_get_main_queue(), ^{
+            SetupMenuGesture();
+        });
 
-        WriteLog(@"=== VASYWARE READY ===");
+        WriteLog(@"=== VASYWARE LOADED ===");
     }
-}
-
-// =================================================================
-// ЛОГИ
-// =================================================================
-
-void WriteLog(NSString *message) {
-    NSString *docPath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-    NSString *logPath = [docPath stringByAppendingPathComponent:@"vasyaware_log.txt"];
-    
-    NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
-    [formatter setDateFormat:@"yyyy-MM-dd HH:mm:ss"];
-    NSString *timestamp = [formatter stringFromDate:[NSDate date]];
-    NSString *logEntry = [NSString stringWithFormat:@"[%@] %@\n", timestamp, message];
-    
-    NSFileHandle *fileHandle = [NSFileHandle fileHandleForWritingAtPath:logPath];
-    if (fileHandle) {
-        [fileHandle seekToEndOfFile];
-        [fileHandle writeData:[logEntry dataUsingEncoding:NSUTF8StringEncoding]];
-        [fileHandle closeFile];
-    } else {
-        [logEntry writeToFile:logPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-    }
-    NSLog(@"[VASYWARE] %@", message);
 }
