@@ -2,7 +2,6 @@
 #import "imgui.h"
 #import "imgui_impl_metal.h"
 #import <Metal/Metal.h>
-#import <MetalKit/MetalKit.h>
 #import <UIKit/UIKit.h>
 
 // =================================================================
@@ -173,7 +172,10 @@ void SetupImGui() {
 void RenderMenu(id<MTLRenderCommandEncoder> encoder) {
     if (!menuVisible || !imguiInitialized || !encoder) return;
 
-    // Создаём render pass descriptor для ImGui
+    // Создаём command buffer для ImGui
+    id<MTLCommandBuffer> commandBuffer = [g_commandQueue commandBuffer];
+    if (!commandBuffer) return;
+
     MTLRenderPassDescriptor* renderPassDescriptor = [MTLRenderPassDescriptor renderPassDescriptor];
     renderPassDescriptor.colorAttachments[0].loadAction = MTLLoadActionLoad;
     renderPassDescriptor.colorAttachments[0].storeAction = MTLStoreActionStore;
@@ -279,5 +281,6 @@ void RenderMenu(id<MTLRenderCommandEncoder> encoder) {
     }
 
     ImGui::Render();
-    ImGui_ImplMetal_RenderDrawData(ImGui::GetDrawData(), g_commandQueue, encoder);
+    ImGui_ImplMetal_RenderDrawData(ImGui::GetDrawData(), commandBuffer, encoder);
+    [commandBuffer commit];
 }
