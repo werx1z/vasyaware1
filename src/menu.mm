@@ -1,11 +1,11 @@
-// menu.mm — Vasyaware ImGui Menu (Metal)
+// menu.mm — Vasyaware ImGui Menu (CAMetalLayer)
 #import "imgui.h"
 #import "imgui_impl_metal.h"
 #import <Metal/Metal.h>
 #import <UIKit/UIKit.h>
 
 // =================================================================
-// ЛОГИ В ФАЙЛ
+// ЛОГИ
 // =================================================================
 
 void WriteLog(NSString *message) {
@@ -25,21 +25,19 @@ void WriteLog(NSString *message) {
     } else {
         [logEntry writeToFile:logPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
     }
-    
     NSLog(@"[VASYWARE] %@", message);
 }
 
 // =================================================================
-// ГЛОБАЛЬНЫЕ ФЛАГИ
+// ФЛАГИ
 // =================================================================
 
 BOOL menuVisible = YES;
 BOOL imguiInitialized = NO;
 
-id<MTLDevice> g_device = nil;
-id<MTLCommandQueue> g_commandQueue = nil;
+extern id<MTLDevice> g_device;
+extern id<MTLCommandQueue> g_commandQueue;
 
-// Combat
 BOOL silentAimEnabled = NO;
 BOOL kickBypassEnabled = NO;
 BOOL hitMarkerEnabled = NO;
@@ -47,21 +45,18 @@ BOOL hitSoundsEnabled = NO;
 BOOL hitMarkerActive = NO;
 float hitMarkerTimer = 0.0f;
 
-// Movement
 BOOL bhopEnabled = NO;
 BOOL speedHackEnabled = NO;
 float speedMultiplier = 5.0f;
 
-// Visuals
 BOOL espEnabled = NO;
 BOOL fogEnabled = NO;
 float fogDensity = 0.05f;
 
-// Config
 BOOL saveConfigOnExit = YES;
 
 // =================================================================
-// ЖЕСТ (3 ПАЛЬЦА, 2 ТАПА)
+// ЖЕСТ
 // =================================================================
 
 static UITapGestureRecognizer* menuGesture = nil;
@@ -91,10 +86,7 @@ static UITapGestureRecognizer* menuGesture = nil;
 void SetupMenuGesture() {
     UIWindow* window = [UIApplication sharedApplication].keyWindow;
     if (!window) window = [[UIApplication sharedApplication].windows firstObject];
-    if (!window) {
-        WriteLog(@"No window for gesture!");
-        return;
-    }
+    if (!window) return;
 
     if (menuGesture) {
         [window removeGestureRecognizer:menuGesture];
@@ -107,12 +99,11 @@ void SetupMenuGesture() {
     menuGesture.numberOfTouchesRequired = 3;
     menuGesture.cancelsTouchesInView = NO;
     [window addGestureRecognizer:menuGesture];
-
     WriteLog(@"Gesture installed: 3 fingers, 2 taps");
 }
 
 // =================================================================
-// СТИЛЬ VASYWARE
+// СТИЛЬ
 // =================================================================
 
 void ApplyVasyawareStyle() {
@@ -138,50 +129,43 @@ void ApplyVasyawareStyle() {
 }
 
 // =================================================================
-// ИНИЦИАЛИЗАЦИЯ IMGUI (METAL)
+// ИНИЦИАЛИЗАЦИЯ
 // =================================================================
 
 void SetupImGui() {
     if (imguiInitialized) return;
-    
-    g_device = MTLCreateSystemDefaultDevice();
     if (!g_device) {
-        WriteLog(@"Metal device NOT created!");
+        WriteLog(@"Cannot init ImGui - no Metal device!");
         return;
     }
-    g_commandQueue = [g_device newCommandQueue];
-    if (!g_commandQueue) {
-        WriteLog(@"Metal command queue NOT created!");
-        return;
-    }
-
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     ApplyVasyawareStyle();
     ImGui_ImplMetal_Init(g_device);
-
     imguiInitialized = YES;
-    WriteLog(@"ImGui Metal initialized!");
+    WriteLog(@"ImGui initialized!");
 }
 
 // =================================================================
-// ОТРИСОВКА МЕНЮ (METAL)
+// ОТРИСОВКА
 // =================================================================
 
-void RenderMenu(id<MTLRenderCommandEncoder> encoder) {
-    if (!menuVisible || !imguiInitialized || !encoder) return;
+void RenderMenu(id<MTLCommandBuffer> commandBuffer, id<MTLRenderCommandEncoder> encoder) {
+    if (!menuVisible || !encoder || !commandBuffer) return;
 
-    // Создаём command buffer для ImGui
-    id<MTLCommandBuffer> commandBuffer = [g_commandQueue commandBuffer];
-    if (!commandBuffer) return;
+    static BOOL initialized = NO;
+    if (!initialized) {
+        SetupImGui();
+        initialized = YES;
+    }
+    if (!imguiInitialized) return;
 
-    MTLRenderPassDescriptor* renderPassDescriptor = [MTLRenderPassDescriptor renderPassDescriptor];
-    renderPassDescriptor.colorAttachments[0].loadAction = MTLLoadActionLoad;
-    renderPassDescriptor.colorAttachments[0].storeAction = MTLStoreActionStore;
-    renderPassDescriptor.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
+    MTLRenderPassDescriptor* passDescriptor = [MTLRenderPassDescriptor renderPassDescriptor];
+    passDescriptor.colorAttachments[0].loadAction = MTLLoadActionLoad;
+    passDescriptor.colorAttachments[0].storeAction = MTLStoreActionStore;
 
-    ImGui_ImplMetal_NewFrame(renderPassDescriptor);
+    ImGui_ImplMetal_NewFrame(passDescriptor);
     ImGui::NewFrame();
 
     CGSize screen = [UIScreen mainScreen].bounds.size;
@@ -197,7 +181,6 @@ void RenderMenu(id<MTLRenderCommandEncoder> encoder) {
     ImGui::Spacing();
 
     if (ImGui::BeginTabBar("VasyawareTabs")) {
-        // COMBAT
         if (ImGui::BeginTabItem("Combat")) {
             ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "AIMBOT");
             ImGui::Separator();
@@ -213,8 +196,6 @@ void RenderMenu(id<MTLRenderCommandEncoder> encoder) {
             ImGui::Checkbox("Hit Sounds", &hitSoundsEnabled);
             ImGui::EndTabItem();
         }
-
-        // MOVEMENT
         if (ImGui::BeginTabItem("Movement")) {
             ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "MOVEMENT");
             ImGui::Separator();
@@ -225,8 +206,6 @@ void RenderMenu(id<MTLRenderCommandEncoder> encoder) {
             }
             ImGui::EndTabItem();
         }
-
-        // VISUALS
         if (ImGui::BeginTabItem("Visuals")) {
             ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.4f, 1.0f), "VISUALS");
             ImGui::Separator();
@@ -237,8 +216,6 @@ void RenderMenu(id<MTLRenderCommandEncoder> encoder) {
             }
             ImGui::EndTabItem();
         }
-
-        // CONFIG
         if (ImGui::BeginTabItem("Config")) {
             ImGui::TextColored(ImVec4(0.8f, 0.8f, 0.8f, 1.0f), "SETTINGS");
             ImGui::Separator();
@@ -261,26 +238,11 @@ void RenderMenu(id<MTLRenderCommandEncoder> encoder) {
             ImGui::Text("Built: %s", __DATE__);
             ImGui::EndTabItem();
         }
-
         ImGui::EndTabBar();
     }
 
     ImGui::End();
 
-    // Hit Marker
-    if (hitMarkerActive && hitMarkerTimer > 0) {
-        ImDrawList* drawList = ImGui::GetForegroundDrawList();
-        ImVec2 center = ImVec2(screen.width / 2, screen.height / 2);
-        float size = 15.0f;
-        ImU32 color = IM_COL32(255, 50, 50, 255);
-
-        drawList->AddLine(ImVec2(center.x - size, center.y - size), ImVec2(center.x - size/3, center.y - size/3), color, 2.5f);
-        drawList->AddLine(ImVec2(center.x + size/3, center.y - size/3), ImVec2(center.x + size, center.y - size), color, 2.5f);
-        drawList->AddLine(ImVec2(center.x - size, center.y + size), ImVec2(center.x - size/3, center.y + size/3), color, 2.5f);
-        drawList->AddLine(ImVec2(center.x + size/3, center.y + size/3), ImVec2(center.x + size, center.y + size), color, 2.5f);
-    }
-
     ImGui::Render();
     ImGui_ImplMetal_RenderDrawData(ImGui::GetDrawData(), commandBuffer, encoder);
-    [commandBuffer commit];
 }
