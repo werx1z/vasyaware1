@@ -1,7 +1,8 @@
 // main.mm — Vasyaware main с логами
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
-#import <mach-o/d <mach/mach.h>
+#import <mach-o/dyld.h>
+#import <mach/mach.h>
 #import <UIKit/UIKit.h>
 #import <OpenGLES/ES2/gl.h>
 #import <OpenGLES/ES2/glext.h>
