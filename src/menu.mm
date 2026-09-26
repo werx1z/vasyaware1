@@ -1,8 +1,8 @@
-// menu.mm — Vasyaware ImGui Menu + Logs
+// menu.mm — Vasyaware ImGui Menu (Metal)
 #import "imgui.h"
-#import "imgui_impl_opengl3.h"
-#import <OpenGLES/ES2/gl.h>
-#import <OpenGLES/ES2/glext.h>
+#import "imgui_impl_metal.h"
+#import <Metal/Metal.h>
+#import <MetalKit/MetalKit.h>
 #import <UIKit/UIKit.h>
 
 // =================================================================
@@ -36,6 +36,9 @@ void WriteLog(NSString *message) {
 
 BOOL menuVisible = YES;
 BOOL imguiInitialized = NO;
+
+id<MTLDevice> g_device = nil;
+id<MTLCommandQueue> g_commandQueue = nil;
 
 // Combat
 BOOL silentAimEnabled = NO;
@@ -136,27 +139,41 @@ void ApplyVasyawareStyle() {
 }
 
 // =================================================================
-// ИНИЦИАЛИЗАЦИЯ
+// ИНИЦИАЛИЗАЦИЯ IMGUI (METAL)
 // =================================================================
 
 void SetupImGui() {
+    if (imguiInitialized) return;
+    
+    g_device = MTLCreateSystemDefaultDevice();
+    if (!g_device) {
+        WriteLog(@"Metal device NOT created!");
+        return;
+    }
+    g_commandQueue = [g_device newCommandQueue];
+    if (!g_commandQueue) {
+        WriteLog(@"Metal command queue NOT created!");
+        return;
+    }
+
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     ApplyVasyawareStyle();
-    ImGui_ImplOpenGL3_Init("#version 100");
+    ImGui_ImplMetal_Init(g_device);
+
     imguiInitialized = YES;
-    WriteLog(@"ImGui initialized");
+    WriteLog(@"ImGui Metal initialized!");
 }
 
 // =================================================================
-// ОТРИСОВКА МЕНЮ
+// ОТРИСОВКА МЕНЮ (METAL)
 // =================================================================
 
-void RenderMenu() {
-    if (!menuVisible || !imguiInitialized) return;
+void RenderMenu(id<MTLRenderCommandEncoder> encoder) {
+    if (!menuVisible || !imguiInitialized || !encoder) return;
 
-    ImGui_ImplOpenGL3_NewFrame();
+    ImGui_ImplMetal_NewFrame((__bridge MTLRenderPassDescriptor*)nil);
     ImGui::NewFrame();
 
     CGSize screen = [UIScreen mainScreen].bounds.size;
@@ -256,5 +273,5 @@ void RenderMenu() {
     }
 
     ImGui::Render();
-    ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+    ImGui_ImplMetal_RenderDrawData(ImGui::GetDrawData(), g_commandQueue, encoder);
 }
