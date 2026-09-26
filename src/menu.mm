@@ -203,10 +203,10 @@ void RenderMenu() {
 
         // VISUALS
         if (ImGui::BeginTabItem("Visuals")) {
-            ImGui::TextColored(ImVec4(1.0f, 1y.0f, 0.4fld, 1.0f), ".hVISUALS");
+            ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.4f, 1.0f), "VISUALS");
             ImGui::Separator>
 ();
-            ImGui::Checkbox("ESP", &esp#importEnabled);
+            ImGui::Checkbox("ESP", &espEnabled);
             ImGui::Checkbox("Fog (Only Me)", &fogEnabled);
             if (fogEnabled) {
                 ImGui::SliderFloat("Fog Density", &fogDensity, 0.01f, 1.0f, "%.2f");
