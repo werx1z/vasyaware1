@@ -1,11 +1,14 @@
-// menu.mm — Vasyaware ImGui Menu
+// menu.mm — Vasyaware ImGui Menu (OpenGL3)
 #import "imgui.h"
-#import "imgui_impl_opengl2.h"
+#import "imgui_impl_opengl3.h"
 #import <OpenGLES/ES2/gl.h>
 #import <OpenGLES/ES2/glext.h>
 #import <UIKit/UIKit.h>
 
-// Глобальные флаги
+// =================================================================
+// ГЛОБАЛЬНЫЕ ФЛАГИ
+// =================================================================
+
 BOOL menuVisible = YES;
 BOOL imguiInitialized = NO;
 
@@ -113,7 +116,7 @@ void SetupImGui() {
     ImGui::CreateContext();
     ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     ApplyVasyawareStyle();
-    ImGui_ImplOpenGL2_Init();
+    ImGui_ImplOpenGL3_Init("#version 100");  // OpenGL ES 2.0
     imguiInitialized = YES;
 }
 
@@ -124,7 +127,7 @@ void SetupImGui() {
 void RenderMenu() {
     if (!menuVisible || !imguiInitialized) return;
 
-    ImGui_ImplOpenGL2_NewFrame();
+    ImGui_ImplOpenGL3_NewFrame();
     ImGui::NewFrame();
 
     CGSize screen = [UIScreen mainScreen].bounds.size;
@@ -224,5 +227,5 @@ void RenderMenu() {
     }
 
     ImGui::Render();
-    ImGui_ImplOpenGL2_RenderDrawData(ImGui::GetDrawData());
+    ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 }
