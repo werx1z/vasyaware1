@@ -44,6 +44,8 @@ jobs:
             -framework QuartzCore \
             -framework CoreGraphics \
             -I src/ \
+            -L src/ \
+            -lsubstrate \
             -DGLES_SILENCE_DEPRECATION \
             -O2 \
             -o build/vasyaware.dylib \
