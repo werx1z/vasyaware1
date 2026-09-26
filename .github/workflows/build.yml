@@ -29,6 +29,14 @@ jobs:
           cp /tmp/imgui/backends/imgui_impl_opengl2.h src/
           cp /tmp/imgui/backends/imgui_impl_opengl2.cpp src/
 
+      - name: Fix ImGui OpenGL for iOS
+        run: |
+          sed -i '' 's|#include <OpenGL/gl.h>|#include <OpenGLES/ES2/gl.h>|' src/imgui_impl_opengl2.cpp
+          sed -i '' 's|#include <OpenGL/glu.h>|// #include <OpenGL/glu.h>|' src/imgui_impl_opengl2.cpp
+          sed -i '' 's|gluOrtho2D|glOrthof|' src/imgui_impl_opengl2.cpp
+          sed -i '' 's|glPushAttrib|// glPushAttrib|' src/imgui_impl_opengl2.cpp
+          sed -i '' 's|glPopAttrib|// glPopAttrib|' src/imgui_impl_opengl2.cpp
+
       - name: Compile dylib
         run: |
           mkdir -p build
