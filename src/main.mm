@@ -1,4 +1,4 @@
-// main.mm — Vasyaware main с Metal-хуком
+// main.mm — Vasyaware main с ожиданием UnityFramework
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 #import <mach-o/dyld.h>
@@ -23,20 +23,49 @@ void WriteLog(NSString *message);
 
 uintptr_t unityFramework = 0;
 
-uintptr_t GetUnityFramework() {
-    for (int i = 0; i < _dyld_image_count(); i++) {
-        const char *name = _dyld_get_image_name(i);
-        if (strstr(name, "UnityFramework")) {
-            WriteLog([NSString stringWithFormat:@"Found UnityFramework: %s", name]);
-            return (uintptr_t)_dyld_get_image_header(i);
+// =================================================================
+// ОЖИДАНИЕ UNITYFRAMEWORK (до 30 секунд)
+// =================================================================
+
+uintptr_t WaitForUnityFramework() {
+    for (int attempt = 0; attempt < 300; attempt++) {
+        for (int i = 0; i < _dyld_image_count(); i++) {
+            const char *name = _dyld_get_image_name(i);
+            if (name && strstr(name, "UnityFramework")) {
+                WriteLog([NSString stringWithFormat:@"Found UnityFramework on attempt %d: %s", attempt, name]);
+                return (uintptr_t)_dyld_get_image_header(i);
+            }
         }
+        usleep(100000); // 100 мс
     }
-    WriteLog(@"UnityFramework NOT found!");
+    WriteLog(@"UnityFramework NOT found after 30 seconds!");
     return 0;
 }
 
 // =================================================================
-// ХУК НА METAL: drawPrimitives
+// ХУК НА glDrawArrays (если игра на OpenGL)
+// =================================================================
+
+static int drawCounter = 0;
+static void (*orig_glDrawArrays)(GLenum, GLint, GLsizei);
+static void hooked_glDrawArrays(GLenum mode, GLint first, GLsizei count) {
+    orig_glDrawArrays(mode, first, count);
+    drawCounter++;
+
+    static BOOL firstDraw = NO;
+    if (!firstDraw) {
+        WriteLog(@"First glDrawArrays call - initializing ImGui");
+        SetupImGui();
+        firstDraw = YES;
+    }
+
+    if (drawCounter % 200 == 0) {
+        RenderMenu(nil); // передаём nil, если Metal
+    }
+}
+
+// =================================================================
+// ХУК НА METAL: drawPrimitives (если игра на Metal)
 // =================================================================
 
 typedef void (*DrawPrimitivesFunc)(id, SEL, MTLPrimitiveType, NSInteger, NSInteger);
@@ -89,7 +118,7 @@ static void hooked_Move(void* self) {
 }
 
 void SetupHooks() {
-    unityFramework = GetUnityFramework();
+    unityFramework = WaitForUnityFramework();
     if (!unityFramework) {
         WriteLog(@"Cannot setup hooks - no UnityFramework");
         return;
@@ -115,33 +144,63 @@ void SetupHooks() {
 // =================================================================
 
 void SetupMetalHook() {
-    Class encoderClass = objc_getClass("MTLRenderCommandEncoder");
-    if (!encoderClass) {
-        WriteLog(@"MTLRenderCommandEncoder NOT found!");
-        return;
-    }
+    // MTLRenderCommandEncoder — это протокол, не класс.
+    // Ищем конкретные классы, которые его реализуют.
+    const char* classes[] = {
+        "AGXG13XFamilyRenderContext",
+        "AGXG14XFamilyRenderContext",
+        "AGXG15XFamilyRenderContext",
+        "MTLRenderCommandEncoder",
+        "MTLDebugRenderCommandEncoder"
+    };
     
-    SEL selector = NSSelectorFromString(@"drawPrimitives:vertexStart:vertexCount:");
-    Method method = class_getInstanceMethod(encoderClass, selector);
-    
-    if (method) {
-        IMP imp = method_getImplementation(method);
-        orig_drawPrimitives = (DrawPrimitivesFunc)imp;
-        method_setImplementation(method, (IMP)hooked_drawPrimitives);
-        WriteLog(@"Metal hook installed: drawPrimitives");
-    } else {
-        WriteLog(@"drawPrimitives method NOT found!");
+    for (int i = 0; i < 5; i++) {
+        Class cls = objc_getClass(classes[i]);
+        if (!cls) continue;
+        
+        SEL selector = NSSelectorFromString(@"drawPrimitives:vertexStart:vertexCount:");
+        Method method = class_getInstanceMethod(cls, selector);
+        if (method) {
+            IMP imp = method_getImplementation(method);
+            orig_drawPrimitives = (DrawPrimitivesFunc)imp;
+            method_setImplementation(method, (IMP)hooked_drawPrimitives);
+            WriteLog([NSString stringWithFormat:@"Metal hook installed on %s", classes[i]]);
+            return;
+        }
     }
+    WriteLog(@"Metal hook NOT installed (no suitable class found)");
 }
+
+// =================================================================
+// ТОЧКА ВХОДА
+// =================================================================
 
 __attribute__((constructor)) static void init() {
     @autoreleasepool {
         WriteLog(@"=== VASYWARE LOADING ===");
         [NSThread sleepForTimeInterval:3.0];
 
+        // Логируем все модули для диагностики
+        WriteLog(@"--- Loaded modules ---");
+        for (int i = 0; i < _dyld_image_count(); i++) {
+            const char *name = _dyld_get_image_name(i);
+            if (name && (strstr(name, "Chicken") || strstr(name, "Unity") || strstr(name, "Game") || strstr(name, "Frameworks"))) {
+                WriteLog([NSString stringWithFormat:@"Module: %s", name]);
+            }
+        }
+        WriteLog(@"--- End modules ---");
+
+        // Ставим хук на glDrawArrays (если OpenGL)
+        MSHookFunction((void*)glDrawArrays, (void*)hooked_glDrawArrays, (void**)&orig_glDrawArrays);
+        WriteLog(@"Hook: glDrawArrays installed");
+
+        // Ставим Metal-хук (если Metal)
         SetupMetalHook();
+
+        // Ставим хуки на CharacterMotor
         SetupHooks();
 
+        // Жест
         dispatch_async(dispatch_get_main_queue(), ^{
             SetupMenuGesture();
         });
