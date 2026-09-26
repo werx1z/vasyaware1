@@ -26,9 +26,8 @@ jobs:
           cp /tmp/imgui/imstb_rectpack.h src/
           cp /tmp/imgui/imstb_textedit.h src/
           cp /tmp/imgui/imstb_truetype.h src/
-          cp /tmp/imgui/backends/imgui_impl_opengl3.h src/
-          cp /tmp/imgui/backends/imgui_impl_opengl3.cpp src/
-          cp /tmp/imgui/backends/imgui_impl_opengl3_loader.h src/
+          cp /tmp/imgui/backends/imgui_impl_metal.h src/
+          cp /tmp/imgui/backends/imgui_impl_metal.mm src/
 
       - name: Compile dylib
         run: |
@@ -40,13 +39,12 @@ jobs:
             -dynamiclib \
             -framework Foundation \
             -framework UIKit \
-            -framework OpenGLES \
+            -framework Metal \
             -framework QuartzCore \
             -framework CoreGraphics \
             -I src/ \
             -L src/ \
             -lsubstrate \
-            -DGLES_SILENCE_DEPRECATION \
             -O2 \
             -o build/vasyaware.dylib \
             src/main.mm \
@@ -55,7 +53,7 @@ jobs:
             src/imgui_draw.cpp \
             src/imgui_tables.cpp \
             src/imgui_widgets.cpp \
-            src/imgui_impl_opengl3.cpp
+            src/imgui_impl_metal.mm
 
       - name: Upload dylib
         uses: actions/upload-artifact@v4
