@@ -39,12 +39,14 @@ uintptr_t GetUnityFramework() {
 // ХУК НА METAL: drawPrimitives
 // =================================================================
 
-static void (*orig_drawPrimitives)(id self, SEL _cmd, MTLPrimitiveType type, NSInteger vertexStart, NSInteger vertexCount);
+typedef void (*DrawPrimitivesFunc)(id, SEL, MTLPrimitiveType, NSInteger, NSInteger);
+static DrawPrimitivesFunc orig_drawPrimitives = NULL;
+
 static void hooked_drawPrimitives(id self, SEL _cmd, MTLPrimitiveType type, NSInteger vertexStart, NSInteger vertexCount) {
-    // Вызываем оригинал
-    orig_drawPrimitives(self, _cmd, type, vertexStart, vertexCount);
+    if (orig_drawPrimitives) {
+        orig_drawPrimitives(self, _cmd, type, vertexStart, vertexCount);
+    }
     
-    // Рисуем ImGui один раз за кадр
     static int drawCount = 0;
     drawCount++;
     
@@ -55,7 +57,6 @@ static void hooked_drawPrimitives(id self, SEL _cmd, MTLPrimitiveType type, NSIn
         imguiReady = YES;
     }
     
-    // Рисуем каждый 100-й вызов
     if (drawCount % 100 == 0) {
         RenderMenu((id<MTLRenderCommandEncoder>)self);
     }
@@ -110,7 +111,7 @@ void SetupHooks() {
 }
 
 // =================================================================
-// УСТАНОВКА METAL-ХУКА (через Method Swizzling)
+// УСТАНОВКА METAL-ХУКА
 // =================================================================
 
 void SetupMetalHook() {
@@ -124,7 +125,8 @@ void SetupMetalHook() {
     Method method = class_getInstanceMethod(encoderClass, selector);
     
     if (method) {
-        orig_drawPrimitives = (void*)method_getImplementation(method);
+        IMP imp = method_getImplementation(method);
+        orig_drawPrimitives = (DrawPrimitivesFunc)imp;
         method_setImplementation(method, (IMP)hooked_drawPrimitives);
         WriteLog(@"Metal hook installed: drawPrimitives");
     } else {
