@@ -53,10 +53,10 @@ uintptr_t WaitForUnityFramework() {
 // ХУК НА presentDrawable:
 // =================================================================
 
-static void (*orig_presentDrawable)(id, SEL, id<CAMetalDrawable>);
+typedef void (*PresentDrawableFunc)(id, SEL, id<CAMetalDrawable>);
+static PresentDrawableFunc orig_presentDrawable = NULL;
+
 static void hooked_presentDrawable(id self, SEL _cmd, id<CAMetalDrawable> drawable) {
-    // self = MTLCommandBuffer, drawable = CAMetalDrawable
-    
     static BOOL imguiReady = NO;
     if (!imguiReady) {
         WriteLog(@"First presentDrawable - initializing ImGui");
@@ -64,7 +64,6 @@ static void hooked_presentDrawable(id self, SEL _cmd, id<CAMetalDrawable> drawab
         imguiReady = YES;
     }
     
-    // Рисуем ImGui в тот же command buffer
     if (menuVisible) {
         id<MTLCommandBuffer> commandBuffer = (id<MTLCommandBuffer>)self;
         
@@ -78,15 +77,10 @@ static void hooked_presentDrawable(id self, SEL _cmd, id<CAMetalDrawable> drawab
         [encoder endEncoding];
     }
     
-    // Вызываем оригинал
     if (orig_presentDrawable) {
         orig_presentDrawable(self, _cmd, drawable);
     }
 }
-
-// =================================================================
-// УСТАНОВКА ХУКА НА presentDrawable:
-// =================================================================
 
 void SetupMetalHook() {
     Class cmdBufferClass = objc_getClass("MTLCommandBuffer");
@@ -95,8 +89,6 @@ void SetupMetalHook() {
         return;
     }
     
-    // Ищем протокол MTLCommandBuffer (это протокол, не класс)
-    // Но реальные объекты имеют классы типа AGXCommandBuffer
     const char* classes[] = {
         "AGXCommandBuffer",
         "AGXG13XFamilyCommandBuffer",
@@ -115,7 +107,7 @@ void SetupMetalHook() {
         Method method = class_getInstanceMethod(cls, selector);
         if (method) {
             IMP imp = method_getImplementation(method);
-            orig_presentDrawable = (void*)imp;
+            orig_presentDrawable = (PresentDrawableFunc)imp;
             method_setImplementation(method, (IMP)hooked_presentDrawable);
             WriteLog([NSString stringWithFormat:@"Metal hook installed on %s", classes[i]]);
             return;
@@ -180,7 +172,6 @@ __attribute__((constructor)) static void init() {
         WriteLog(@"=== VASYWARE LOADING ===");
         [NSThread sleepForTimeInterval:3.0];
 
-        // Логируем модули
         WriteLog(@"--- Loaded modules ---");
         for (int i = 0; i < _dyld_image_count(); i++) {
             const char *name = _dyld_get_image_name(i);
@@ -190,13 +181,9 @@ __attribute__((constructor)) static void init() {
         }
         WriteLog(@"--- End modules ---");
 
-        // Устанавливаем Metal-хук
         SetupMetalHook();
-
-        // Ждём UnityFramework и ставим хуки
         SetupHooks();
 
-        // Жест
         dispatch_async(dispatch_get_main_queue(), ^{
             SetupMenuGesture();
         });
