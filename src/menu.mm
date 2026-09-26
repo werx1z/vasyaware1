@@ -1,9 +1,34 @@
-// menu.mm — Vasyaware ImGui Menu (OpenGL3)
+// menu.mm — Vasyaware ImGui Menu + Logs
 #import "imgui.h"
 #import "imgui_impl_opengl3.h"
 #import <OpenGLES/ES2/gl.h>
 #import <OpenGLES/ES2/glext.h>
 #import <UIKit/UIKit.h>
+
+// =================================================================
+// ЛОГИ В ФАЙЛ
+// =================================================================
+
+void WriteLog(NSString *message) {
+    NSString *docPath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    NSString *logPath = [docPath stringByAppendingPathComponent:@"vasyaware_log.txt"];
+    
+    NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
+    [formatter setDateFormat:@"yyyy-MM-dd HH:mm:ss"];
+    NSString *timestamp = [formatter stringFromDate:[NSDate date]];
+    NSString *logEntry = [NSString stringWithFormat:@"[%@] %@\n", timestamp, message];
+    
+    NSFileHandle *fileHandle = [NSFileHandle fileHandleForWritingAtPath:logPath];
+    if (fileHandle) {
+        [fileHandle seekToEndOfFile];
+        [fileHandle writeData:[logEntry dataUsingEncoding:NSUTF8StringEncoding]];
+        [fileHandle closeFile];
+    } else {
+        [logEntry writeToFile:logPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    }
+    
+    NSLog(@"[VASYWARE] %@", message);
+}
 
 // =================================================================
 // ГЛОБАЛЬНЫЕ ФЛАГИ
@@ -56,7 +81,7 @@ static UITapGestureRecognizer* menuGesture = nil;
 - (void)handleGesture:(UITapGestureRecognizer*)recognizer {
     if (recognizer.state == UIGestureRecognizerStateEnded) {
         menuVisible = !menuVisible;
-        NSLog(@"[VASYWARE] Menu: %@", menuVisible ? @"ON" : @"OFF");
+        WriteLog([NSString stringWithFormat:@"Menu: %@", menuVisible ? @"ON" : @"OFF"]);
     }
 }
 @end
@@ -64,7 +89,10 @@ static UITapGestureRecognizer* menuGesture = nil;
 void SetupMenuGesture() {
     UIWindow* window = [UIApplication sharedApplication].keyWindow;
     if (!window) window = [[UIApplication sharedApplication].windows firstObject];
-    if (!window) return;
+    if (!window) {
+        WriteLog(@"No window for gesture!");
+        return;
+    }
 
     if (menuGesture) {
         [window removeGestureRecognizer:menuGesture];
@@ -78,7 +106,7 @@ void SetupMenuGesture() {
     menuGesture.cancelsTouchesInView = NO;
     [window addGestureRecognizer:menuGesture];
 
-    NSLog(@"[VASYWARE] Gesture installed: 3 fingers, 2 taps");
+    WriteLog(@"Gesture installed: 3 fingers, 2 taps");
 }
 
 // =================================================================
@@ -116,8 +144,9 @@ void SetupImGui() {
     ImGui::CreateContext();
     ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     ApplyVasyawareStyle();
-    ImGui_ImplOpenGL3_Init("#version 100");  // OpenGL ES 2.0
+    ImGui_ImplOpenGL3_Init("#version 100");
     imguiInitialized = YES;
+    WriteLog(@"ImGui initialized");
 }
 
 // =================================================================
@@ -174,9 +203,10 @@ void RenderMenu() {
 
         // VISUALS
         if (ImGui::BeginTabItem("Visuals")) {
-            ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.4f, 1.0f), "VISUALS");
-            ImGui::Separator();
-            ImGui::Checkbox("ESP", &espEnabled);
+            ImGui::TextColored(ImVec4(1.0f, 1y.0f, 0.4fld, 1.0f), ".hVISUALS");
+            ImGui::Separator>
+();
+            ImGui::Checkbox("ESP", &esp#importEnabled);
             ImGui::Checkbox("Fog (Only Me)", &fogEnabled);
             if (fogEnabled) {
                 ImGui::SliderFloat("Fog Density", &fogDensity, 0.01f, 1.0f, "%.2f");
