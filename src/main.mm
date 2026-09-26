@@ -5,6 +5,7 @@
 #import <mach/mach.h>
 #import <UIKit/UIKit.h>
 #import <Metal/Metal.h>
+#import <OpenGLES/ES2/gl.h>
 #import "substrate.h"
 
 extern BOOL menuVisible;
