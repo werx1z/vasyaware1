@@ -173,7 +173,13 @@ void SetupImGui() {
 void RenderMenu(id<MTLRenderCommandEncoder> encoder) {
     if (!menuVisible || !imguiInitialized || !encoder) return;
 
-    ImGui_ImplMetal_NewFrame((__bridge MTLRenderPassDescriptor*)nil);
+    // Создаём render pass descriptor для ImGui
+    MTLRenderPassDescriptor* renderPassDescriptor = [MTLRenderPassDescriptor renderPassDescriptor];
+    renderPassDescriptor.colorAttachments[0].loadAction = MTLLoadActionLoad;
+    renderPassDescriptor.colorAttachments[0].storeAction = MTLStoreActionStore;
+    renderPassDescriptor.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
+
+    ImGui_ImplMetal_NewFrame(renderPassDescriptor);
     ImGui::NewFrame();
 
     CGSize screen = [UIScreen mainScreen].bounds.size;
