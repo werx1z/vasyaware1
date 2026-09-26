@@ -15,6 +15,7 @@ void SetupImGui(void);
 void RenderMenu(id<MTLCommandBuffer> commandBuffer, id<MTLRenderCommandEncoder> encoder);
 void SetupMenuGesture(void);
 void WriteLog(NSString *message);
+void RenderImGuiFrame(void);
 
 // RVA из дампа UnityFramework
 #define RVA_DAMAGE_RPC          0x3d86f64
