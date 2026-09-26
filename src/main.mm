@@ -1,139 +1,86 @@
-// main.mm — Vasyaware с хуком на presentDrawable:
+// main.mm — Проверка старых RVA на ChickenGun
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 #import <mach-o/dyld.h>
 #import <mach/mach.h>
 #import <UIKit/UIKit.h>
-#import <Metal/Metal.h>
-#import <QuartzCore/CAMetalLayer.h>
 #import "substrate.h"
 
-extern BOOL menuVisible;
-extern BOOL bhopEnabled;
-extern BOOL kickBypassEnabled;
+// =================================================================
+// ЛОГИ
+// =================================================================
 
-void SetupImGui(void);
-void RenderMenu(id<MTLCommandBuffer> commandBuffer, id<MTLRenderCommandEncoder> encoder);
-void SetupMenuGesture(void);
-void WriteLog(NSString *message);
+void WriteLog(NSString *message) {
+    NSString *docPath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    NSString *logPath = [docPath stringByAppendingPathComponent:@"vasyaware_log.txt"];
+    
+    NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
+    [formatter setDateFormat:@"yyyy-MM-dd HH:mm:ss"];
+    NSString *timestamp = [formatter stringFromDate:[NSDate date]];
+    NSString *logEntry = [NSString stringWithFormat:@"[%@] %@\n", timestamp, message];
+    
+    NSFileHandle *fileHandle = [NSFileHandle fileHandleForWritingAtPath:logPath];
+    if (fileHandle) {
+        [fileHandle seekToEndOfFile];
+        [fileHandle writeData:[logEntry dataUsingEncoding:NSUTF8StringEncoding]];
+        [fileHandle closeFile];
+    } else {
+        [logEntry writeToFile:logPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    }
+    NSLog(@"[VASYWARE] %@", message);
+}
 
-// RVA из дампа UnityFramework
+// =================================================================
+// ПОИСК CHICKENGUN
+// =================================================================
+
+uintptr_t chickenGun = 0;
+
+uintptr_t WaitForChickenGun() {
+    WriteLog(@"Waiting for ChickenGun...");
+    for (int attempt = 0; attempt < 600; attempt++) {
+        for (int i = 0; i < _dyld_image_count(); i++) {
+            const char *name = _dyld_get_image_name(i);
+            if (!name) continue;
+            if (strstr(name, "ChickenGun") && !strstr(name, ".dylib")) {
+                WriteLog([NSString stringWithFormat:@"Found ChickenGun: %s", name]);
+                return (uintptr_t)_dyld_get_image_header(i);
+            }
+        }
+        usleep(100000);
+    }
+    WriteLog(@"ChickenGun NOT found!");
+    return 0;
+}
+
+// =================================================================
+// RVA ИЗ ДАМПА UNITYFRAMEWORK
+// =================================================================
+
 #define RVA_DAMAGE_RPC          0x3d86f64
 #define RVA_CAN_JUMP            0x3d89c34
 #define RVA_CHEATER             0x3d8c534
 #define RVA_MOVE                0x3d854b0
 
-uintptr_t unityFramework = 0;
-
 // =================================================================
-// ОЖИДАНИЕ UNITYFRAMEWORK
-// =================================================================
-
-uintptr_t WaitForUnityFramework() {
-    WriteLog(@"Waiting for UnityFramework (max 60 seconds)...");
-    for (int attempt = 0; attempt < 600; attempt++) {
-        for (int i = 0; i < _dyld_image_count(); i++) {
-            const char *name = _dyld_get_image_name(i);
-            if (name && strstr(name, "UnityFramework")) {
-                WriteLog([NSString stringWithFormat:@"Found UnityFramework on attempt %d (%.1f sec): %s",
-                          attempt, (float)attempt / 10.0f, name]);
-                return (uintptr_t)_dyld_get_image_header(i);
-            }
-        }
-        if (attempt % 50 == 0 && attempt > 0) {
-            WriteLog([NSString stringWithFormat:@"Still waiting... (%.0f sec)", (float)attempt / 10.0f]);
-        }
-        usleep(100000);
-    }
-    WriteLog(@"UnityFramework NOT found after 60 seconds!");
-    return 0;
-}
-
-// =================================================================
-// ХУК НА presentDrawable:
-// =================================================================
-
-typedef void (*PresentDrawableFunc)(id, SEL, id<CAMetalDrawable>);
-static PresentDrawableFunc orig_presentDrawable = NULL;
-
-static void hooked_presentDrawable(id self, SEL _cmd, id<CAMetalDrawable> drawable) {
-    static BOOL imguiReady = NO;
-    if (!imguiReady) {
-        WriteLog(@"First presentDrawable - initializing ImGui");
-        SetupImGui();
-        imguiReady = YES;
-    }
-    
-    if (menuVisible) {
-        id<MTLCommandBuffer> commandBuffer = (id<MTLCommandBuffer>)self;
-        
-        MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
-        pass.colorAttachments[0].texture = drawable.texture;
-        pass.colorAttachments[0].loadAction = MTLLoadActionLoad;
-        pass.colorAttachments[0].storeAction = MTLStoreActionStore;
-        
-        id<MTLRenderCommandEncoder> encoder = [commandBuffer renderCommandEncoderWithDescriptor:pass];
-        RenderMenu(commandBuffer, encoder);
-        [encoder endEncoding];
-    }
-    
-    if (orig_presentDrawable) {
-        orig_presentDrawable(self, _cmd, drawable);
-    }
-}
-
-void SetupMetalHook() {
-    Class cmdBufferClass = objc_getClass("MTLCommandBuffer");
-    if (!cmdBufferClass) {
-        WriteLog(@"MTLCommandBuffer class NOT found!");
-        return;
-    }
-    
-    const char* classes[] = {
-        "AGXCommandBuffer",
-        "AGXG13XFamilyCommandBuffer",
-        "AGXG14XFamilyCommandBuffer",
-        "AGXG15XFamilyCommandBuffer",
-        "MTLCommandBuffer",
-        "MTLDebugCommandBuffer"
-    };
-    
-    SEL selector = NSSelectorFromString(@"presentDrawable:");
-    
-    for (int i = 0; i < 6; i++) {
-        Class cls = objc_getClass(classes[i]);
-        if (!cls) continue;
-        
-        Method method = class_getInstanceMethod(cls, selector);
-        if (method) {
-            IMP imp = method_getImplementation(method);
-            orig_presentDrawable = (PresentDrawableFunc)imp;
-            method_setImplementation(method, (IMP)hooked_presentDrawable);
-            WriteLog([NSString stringWithFormat:@"Metal hook installed on %s", classes[i]]);
-            return;
-        }
-    }
-    WriteLog(@"Metal hook NOT installed");
-}
-
-// =================================================================
-// ХУКИ НА CharacterMotor
+// ХУКИ (только для проверки)
 // =================================================================
 
 static void (*orig_DamageRPC)(void*, float, int);
 static void hooked_DamageRPC(void* self, float dmg, int fromWhom) {
+    WriteLog(@"DamageRPC called!");
     orig_DamageRPC(self, dmg, fromWhom);
 }
 
 static bool (*orig_CanJump)(void*);
 static bool hooked_CanJump(void* self) {
-    if (bhopEnabled) return true;
+    WriteLog(@"CanJump called!");
     return orig_CanJump(self);
 }
 
 static bool (*orig_Cheater)(void*);
 static bool hooked_Cheater(void* self) {
-    if (kickBypassEnabled) return false;
+    WriteLog(@"Cheater called!");
     return orig_Cheater(self);
 }
 
@@ -142,24 +89,36 @@ static void hooked_Move(void* self) {
     orig_Move(self);
 }
 
+// =================================================================
+// УСТАНОВКА ХУКОВ
+// =================================================================
+
 void SetupHooks() {
-    unityFramework = WaitForUnityFramework();
-    if (!unityFramework) {
-        WriteLog(@"Cannot setup hooks - no UnityFramework");
+    chickenGun = WaitForChickenGun();
+    if (!chickenGun) {
+        WriteLog(@"Cannot setup hooks - no ChickenGun");
         return;
     }
-    WriteLog([NSString stringWithFormat:@"UnityFramework base: 0x%lx", unityFramework]);
+    WriteLog([NSString stringWithFormat:@"ChickenGun base: 0x%lx", chickenGun]);
 
-    MSHookFunction((void*)(unityFramework + RVA_DAMAGE_RPC), (void*)hooked_DamageRPC, (void**)&orig_DamageRPC);
+    uintptr_t addr1 = chickenGun + RVA_DAMAGE_RPC;
+    WriteLog([NSString stringWithFormat:@"DamageRPC addr: 0x%lx", addr1]);
+    MSHookFunction((void*)addr1, (void*)hooked_DamageRPC, (void**)&orig_DamageRPC);
     WriteLog(@"Hook: DamageRPC installed");
 
-    MSHookFunction((void*)(unityFramework + RVA_CAN_JUMP), (void*)hooked_CanJump, (void**)&orig_CanJump);
+    uintptr_t addr2 = chickenGun + RVA_CAN_JUMP;
+    WriteLog([NSString stringWithFormat:@"CanJump addr: 0x%lx", addr2]);
+    MSHookFunction((void*)addr2, (void*)hooked_CanJump, (void**)&orig_CanJump);
     WriteLog(@"Hook: CanJump installed");
 
-    MSHookFunction((void*)(unityFramework + RVA_CHEATER), (void*)hooked_Cheater, (void**)&orig_Cheater);
+    uintptr_t addr3 = chickenGun + RVA_CHEATER;
+    WriteLog([NSString stringWithFormat:@"Cheater addr: 0x%lx", addr3]);
+    MSHookFunction((void*)addr3, (void*)hooked_Cheater, (void**)&orig_Cheater);
     WriteLog(@"Hook: Cheater installed");
 
-    MSHookFunction((void*)(unityFramework + RVA_MOVE), (void*)hooked_Move, (void**)&orig_Move);
+    uintptr_t addr4 = chickenGun + RVA_MOVE;
+    WriteLog([NSString stringWithFormat:@"Move addr: 0x%lx", addr4]);
+    MSHookFunction((void*)addr4, (void*)hooked_Move, (void**)&orig_Move);
     WriteLog(@"Hook: Move installed");
 }
 
@@ -169,25 +128,9 @@ void SetupHooks() {
 
 __attribute__((constructor)) static void init() {
     @autoreleasepool {
-        WriteLog(@"=== VASYWARE LOADING ===");
+        WriteLog(@"=== VASYWARE (RVA TEST) ===");
         [NSThread sleepForTimeInterval:3.0];
-
-        WriteLog(@"--- Loaded modules ---");
-        for (int i = 0; i < _dyld_image_count(); i++) {
-            const char *name = _dyld_get_image_name(i);
-            if (name && (strstr(name, "Chicken") || strstr(name, "Unity"))) {
-                WriteLog([NSString stringWithFormat:@"Module: %s", name]);
-            }
-        }
-        WriteLog(@"--- End modules ---");
-
-        SetupMetalHook();
         SetupHooks();
-
-        dispatch_async(dispatch_get_main_queue(), ^{
-            SetupMenuGesture();
-        });
-
-        WriteLog(@"=== VASYWARE LOADED ===");
+        WriteLog(@"=== VASYWARE READY ===");
     }
 }
