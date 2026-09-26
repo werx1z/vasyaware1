@@ -40,7 +40,6 @@ jobs:
             -framework Foundation \
             -framework UIKit \
             -framework Metal \
-            -framework OpenGLES \
             -framework QuartzCore \
             -framework CoreGraphics \
             -I src/ \
