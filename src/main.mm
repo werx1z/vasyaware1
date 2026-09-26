@@ -1,18 +1,17 @@
-// main.mm — Vasyaware main с логами
+// main.mm — Vasyaware main с Metal-хуком
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 #import <mach-o/dyld.h>
 #import <mach/mach.h>
 #import <UIKit/UIKit.h>
-#import <OpenGLES/ES2/gl.h>
-#import <OpenGLES/ES2/glext.h>
+#import <Metal/Metal.h>
 #import "substrate.h"
 
 extern BOOL menuVisible;
 extern BOOL bhopEnabled;
 extern BOOL kickBypassEnabled;
 void SetupImGui(void);
-void RenderMenu(void);
+void RenderMenu(id<MTLRenderCommandEncoder> encoder);
 void SetupMenuGesture(void);
 void WriteLog(NSString *message);
 
@@ -36,26 +35,36 @@ uintptr_t GetUnityFramework() {
     return 0;
 }
 
-// Хук на glDrawArrays
-static int drawCounter = 0;
-static void (*orig_glDrawArrays)(GLenum, GLint, GLsizei);
-static void hooked_glDrawArrays(GLenum mode, GLint first, GLsizei count) {
-    orig_glDrawArrays(mode, first, count);
-    drawCounter++;
+// =================================================================
+// ХУК НА METAL: drawPrimitives
+// =================================================================
 
-    static BOOL firstDraw = NO;
-    if (!firstDraw) {
-        WriteLog(@"First glDrawArrays call - initializing ImGui");
+static void (*orig_drawPrimitives)(id self, SEL _cmd, MTLPrimitiveType type, NSInteger vertexStart, NSInteger vertexCount);
+static void hooked_drawPrimitives(id self, SEL _cmd, MTLPrimitiveType type, NSInteger vertexStart, NSInteger vertexCount) {
+    // Вызываем оригинал
+    orig_drawPrimitives(self, _cmd, type, vertexStart, vertexCount);
+    
+    // Рисуем ImGui один раз за кадр
+    static int drawCount = 0;
+    drawCount++;
+    
+    static BOOL imguiReady = NO;
+    if (!imguiReady) {
+        WriteLog(@"First Metal draw call - initializing ImGui");
         SetupImGui();
-        firstDraw = YES;
+        imguiReady = YES;
     }
-
-    if (drawCounter % 200 == 0) {
-        RenderMenu();
+    
+    // Рисуем каждый 100-й вызов
+    if (drawCount % 100 == 0) {
+        RenderMenu((id<MTLRenderCommandEncoder>)self);
     }
 }
 
-// Хуки
+// =================================================================
+// ХУКИ НА CharacterMotor
+// =================================================================
+
 static void (*orig_DamageRPC)(void*, float, int);
 static void hooked_DamageRPC(void* self, float dmg, int fromWhom) {
     orig_DamageRPC(self, dmg, fromWhom);
@@ -100,14 +109,35 @@ void SetupHooks() {
     WriteLog(@"Hook: Move installed");
 }
 
+// =================================================================
+// УСТАНОВКА METAL-ХУКА (через Method Swizzling)
+// =================================================================
+
+void SetupMetalHook() {
+    Class encoderClass = objc_getClass("MTLRenderCommandEncoder");
+    if (!encoderClass) {
+        WriteLog(@"MTLRenderCommandEncoder NOT found!");
+        return;
+    }
+    
+    SEL selector = NSSelectorFromString(@"drawPrimitives:vertexStart:vertexCount:");
+    Method method = class_getInstanceMethod(encoderClass, selector);
+    
+    if (method) {
+        orig_drawPrimitives = (void*)method_getImplementation(method);
+        method_setImplementation(method, (IMP)hooked_drawPrimitives);
+        WriteLog(@"Metal hook installed: drawPrimitives");
+    } else {
+        WriteLog(@"drawPrimitives method NOT found!");
+    }
+}
+
 __attribute__((constructor)) static void init() {
     @autoreleasepool {
         WriteLog(@"=== VASYWARE LOADING ===");
         [NSThread sleepForTimeInterval:3.0];
 
-        MSHookFunction((void*)glDrawArrays, (void*)hooked_glDrawArrays, (void**)&orig_glDrawArrays);
-        WriteLog(@"Hook: glDrawArrays installed");
-
+        SetupMetalHook();
         SetupHooks();
 
         dispatch_async(dispatch_get_main_queue(), ^{
