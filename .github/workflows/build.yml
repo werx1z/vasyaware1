@@ -17,10 +17,15 @@ jobs:
         run: |
           git clone --depth 1 https://github.com/ocornut/imgui.git /tmp/imgui
           cp /tmp/imgui/imgui.h src/
+          cp /tmp/imgui/imconfig.h src/
           cp /tmp/imgui/imgui.cpp src/
           cp /tmp/imgui/imgui_draw.cpp src/
           cp /tmp/imgui/imgui_tables.cpp src/
           cp /tmp/imgui/imgui_widgets.cpp src/
+          cp /tmp/imgui/imgui_internal.h src/
+          cp /tmp/imgui/imstb_rectpack.h src/
+          cp /tmp/imgui/imstb_textedit.h src/
+          cp /tmp/imgui/imstb_truetype.h src/
           cp /tmp/imgui/backends/imgui_impl_opengl2.h src/
           cp /tmp/imgui/backends/imgui_impl_opengl2.cpp src/
 
@@ -38,6 +43,7 @@ jobs:
             -framework QuartzCore \
             -framework CoreGraphics \
             -I src/ \
+            -DGLES_SILENCE_DEPRECATION \
             -O2 \
             -o build/vasyaware.dylib \
             src/main.mm \
