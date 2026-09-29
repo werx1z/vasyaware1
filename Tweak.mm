@@ -337,6 +337,8 @@ static void buildUI() {
 
 // ---------------- диагностика хуков ----------------
 static UILabel *g_status;
+static NSMutableSet<NSString *> *g_skip;
+static NSString *skipPath() { return [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject stringByAppendingPathComponent:@"cm_skip.txt"]; }
 static int g_hookOK, g_hookTot;
 static NSString *statePath() {
     return [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject stringByAppendingPathComponent:@"cm_state.txt"];
@@ -344,6 +346,7 @@ static NSString *statePath() {
 static void writeState(NSString *t) { [t writeToFile:statePath() atomically:YES encoding:NSUTF8StringEncoding error:nil]; }
 static void showStatus(NSString *t) { if (g_status) g_status.text = t; NSLog(@"[CM] %@", t); }
 static void doHook(const char *name, uintptr_t addr, void *rep, void **orig) {
+    if ([g_skip containsObject:[NSString stringWithUTF8String:name]]) { NSLog(@"[CM] skip %s", name); return; }
     g_hookTot++;
     writeState([NSString stringWithFormat:@"crash-at:%s", name]);   // если игра упадёт на этом хуке, узнаем при следующем запуске
     int r = HOOKRAW(addr, rep, orig);
@@ -382,12 +385,19 @@ static void setup() {
     NSLog(@"[CM] icall main=%p tr=%p pos=%p w2s=%p fog=%p sky=%p clear=%p look=%p", Cam_main, Comp_get_tr, Tr_get_pos, Cam_w2s, RS_fog, RS_skybox, Cam_clear, Quat_Look);
 
     NSString *prev = [NSString stringWithContentsOfFile:statePath() encoding:NSUTF8StringEncoding error:nil];
+    g_skip = [NSMutableSet set];
+    for (NSString *l in [[NSString stringWithContentsOfFile:skipPath() encoding:NSUTF8StringEncoding error:nil] componentsSeparatedByString:@"\n"])
+        if (l.length) [g_skip addObject:l];
+    if ([prev hasPrefix:@"crash-at:"]) {
+        [g_skip addObject:[prev substringFromIndex:9]];
+        [[g_skip.allObjects componentsJoinedByString:@"\n"] writeToFile:skipPath() atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    }
     buildUI();
     UIWindow *w = keyWin();
     g_status = [[UILabel alloc] initWithFrame:CGRectMake(60, 22, 320, 30)];
     g_status.textColor = UIColor.yellowColor; g_status.font = [UIFont boldSystemFontOfSize:11]; g_status.userInteractionEnabled = NO;
     [w addSubview:g_status];
-    if (prev.length) showStatus([@"prev run: " stringByAppendingString:prev]);
+    if (prev.length) showStatus([NSString stringWithFormat:@"prev run: %@  | skip: %@", prev, [g_skip.allObjects componentsJoinedByString:@","]]);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 4 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
     HOOK(RVA_CM_Start,     h_Start,   &o_Start);
     HOOK(RVA_CM_OnDestroy, h_Destroy, &o_Destroy);
