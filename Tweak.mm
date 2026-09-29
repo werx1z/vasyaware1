@@ -7,7 +7,7 @@
 #include <string.h>
 #if __has_include(<dobby.h>)
 #include <dobby.h>
-#define HOOKRAW(a, r, o) DobbyHook((void *)(a), (dobby_dummy_func_t)(r), (dobby_dummy_func_t *)(o))
+#define HOOKRAW(a, r, o) DobbyHook((void *)(a), (void *)(r), (void **)(o))
 #else
 #include <substrate.h>
 #define HOOKRAW(a, r, o) (MSHookFunction((void *)(a), (void *)(r), (void **)(o)), 0)
