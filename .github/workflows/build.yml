@@ -1,37 +1,45 @@
-name: Build Vasyaware Test
+name: Build ChickenMenu dylib
 
 on:
   push:
-    branches: [ main ]
   workflow_dispatch:
 
 jobs:
   build:
-    runs-on: macos-latest
-
+    runs-on: macos-14
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+
+      - name: Clone Dobby
+        run: git clone --depth 1 https://github.com/jmpews/Dobby.git
+
+      - name: Build Dobby (static, iOS arm64)
+        run: |
+          cmake -S Dobby -B build-dobby \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DDOBBY_GENERATE_SHARED=OFF
+          cmake --build build-dobby --config Release -j4
+          find build-dobby -name "libdobby.a" -print
+          cp "$(find build-dobby -name 'libdobby.a' | head -n1)" libdobby.a
 
       - name: Compile dylib
         run: |
-          mkdir -p build
-          clang++ -arch arm64 \
-            -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
-            -mios-version-min=12.0 \
-            -fobjc-arc \
-            -dynamiclib \
-            -framework Foundation \
-            -framework UIKit \
-            -I src/ \
-            -L src/ \
-            -lsubstrate \
-            -O2 \
-            -o build/vasyaware.dylib \
-            src/main.mm
+          xcrun --sdk iphoneos clang++ \
+            -arch arm64 -miphoneos-version-min=14.0 \
+            -dynamiclib -std=c++17 -fobjc-arc -Wno-deprecated-declarations \
+            -IDobby/include \
+            -o ChickenMenu.dylib Tweak.mm libdobby.a \
+            -framework UIKit -framework Foundation \
+            -framework AudioToolbox -framework QuartzCore \
+            -lc++ \
+            -install_name @executable_path/ChickenMenu.dylib
+          codesign -f -s - ChickenMenu.dylib
+          file ChickenMenu.dylib
 
-      - name: Upload dylib
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: vasyaware
-          path: build/vasyaware.dylib
+          name: ChickenMenu-dylib
+          path: ChickenMenu.dylib
