@@ -15,12 +15,26 @@ jobs:
 
       - name: Build Dobby (static, iOS arm64)
         run: |
-          cmake -S Dobby -B build-dobby \
-            -DCMAKE_SYSTEM_NAME=iOS \
-            -DCMAKE_OSX_ARCHITECTURES=arm64 \
-            -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DDOBBY_GENERATE_SHARED=OFF
+          ls Dobby/cmake || true
+          if [ -f Dobby/cmake/ios.toolchain.cmake ]; then
+            echo "Using Dobby ios.toolchain.cmake"
+            cmake -S Dobby -B build-dobby \
+              -DCMAKE_TOOLCHAIN_FILE="$PWD/Dobby/cmake/ios.toolchain.cmake" \
+              -DPLATFORM=OS64 -DARCHS=arm64 -DDEPLOYMENT_TARGET=14.0 \
+              -DCMAKE_SYSTEM_PROCESSOR=arm64 \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DDOBBY_GENERATE_SHARED=OFF
+          else
+            echo "Fallback: plain iOS cross build"
+            cmake -S Dobby -B build-dobby \
+              -DCMAKE_SYSTEM_NAME=iOS \
+              -DCMAKE_SYSTEM_PROCESSOR=arm64 \
+              -DCMAKE_OSX_SYSROOT=iphoneos \
+              -DCMAKE_OSX_ARCHITECTURES=arm64 \
+              -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DDOBBY_GENERATE_SHARED=OFF
+          fi
           cmake --build build-dobby --config Release -j4
           find build-dobby -name "libdobby.a" -print
           cp "$(find build-dobby -name 'libdobby.a' | head -n1)" libdobby.a
