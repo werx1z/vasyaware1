@@ -47,7 +47,7 @@ jobs:
             -IDobby/include \
             -o ChickenMenu.dylib Tweak.mm libdobby.a \
             -framework UIKit -framework Foundation \
-            -framework AudioToolbox -framework QuartzCore \
+            -framework AudioToolbox -framework QuartzCore -framework CoreGraphics \
             -lc++ \
             -install_name @executable_path/ChickenMenu.dylib
           codesign -f -s - ChickenMenu.dylib
