@@ -31,6 +31,7 @@ static struct {
     int   aaMode  = 1;       // 0 jitter, 1 spin, 2 static, 3 random
     bool  killmsg   = true;   // плашка "killed <ник>" сверху
     bool  sparks    = true;   // искры при убийстве
+    bool  ownAA     = true;   // видеть свой антиаим на своей модели (камера остаётся)
     float headH   = 0.9f;    // высота головы над ногами (умножается на масштаб)
 } C;
 
@@ -162,7 +163,9 @@ static void bc(const char *s) {
     memcpy(b, s, n); b[39] = '\n'; pwrite(g_bcFd, b, sizeof b, 0);
 }
 static void *pickCamera();
+static void applyOwnAA(void *root);
 static void dumpHierarchy();
+static bool g_hasLate;
 
 // ---------------- таблица оригинальных указателей ----------------
 struct OrigE { void *mi; void *fn; };
@@ -286,6 +289,12 @@ static void h_Update(void *self, void *mi) {
         *sp = g_baseSpeed * C.bhopMul;
         if (FN(RVA_CM_IsGrounded, bool, void *, void *)(self, NULL)) FN(RVA_CM_Jump, void, void *, void *)(self, NULL);
     } else if (g_baseSpeed != 0) { *(float *)((uintptr_t)self + OFF_CM_Speed) = g_baseSpeed; }
+    if (!g_hasLate) applyOwnAA(self);
+}
+
+static void h_Late(void *self, void *mi) {
+    fn_v_t o = (fn_v_t)origOf(mi); if (o) o(self, mi);
+    if (self == g_local) applyOwnAA(self);
 }
 
 // silent aim на самой пуле (Update у BaseBulletScript и подклассов)
@@ -334,7 +343,7 @@ static void h_Damage(void *self, float dmg, int from, void *mi) {
 }
 
 // anti-aim: на время сериализации поворачиваем трансформ, потом возвращаем
-static int g_aaTick; static float g_aaSpin;
+static int g_aaTick; static float g_aaSpin, g_aaLastYaw, g_serRate = 10.f; static double g_serT;
 static bool g_inSer, g_cap; static int g_snLog; static NSMutableString *g_snText;
 static float aaYawDeg() {
     float y = C.aaBase;
@@ -355,7 +364,11 @@ static void h_Ser(void *self, void *stream, void *info, void *mi) {
         tr = Comp_get_tr(self);
         if (tr) {
             Tr_get_rot(tr, &saved); g_aaTick++;
-            float a = aaYawDeg() * (float)M_PI / 180.f;
+            float yd = aaYawDeg(); g_aaLastYaw = yd;
+            double nowT = CACurrentMediaTime();
+            if (g_serT > 0) { double d = nowT - g_serT; if (d > 0.01 && d < 1.0) g_serRate = g_serRate * 0.8f + (float)(1.0 / d) * 0.2f; }
+            g_serT = nowT;
+            float a = yd * (float)M_PI / 180.f;
             Quat qy = {0, sinf(a / 2), 0, cosf(a / 2)};
             float pr = C.aaPitch * (float)M_PI / 180.f; Quat qx = {sinf(pr / 2), 0, 0, cosf(pr / 2)};
             Quat q = qmul(qy, qmul(saved, qx));   // yaw вокруг мировой Y, pitch вокруг локальной X
@@ -392,78 +405,16 @@ static void h_SendNext(void *self, void *obj, void *mi) {
 
 // ---------------- ESP ----------------
 static UIFont *gsF(CGFloat s);
-// ---------------- пиксельный шрифт 5x7 + чёрно-белый градиент ----------------
-static const char *PX_SET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ .:-_!?[]()+/|#*";
-static const uint8_t PX_G[][7] = {
-    {0x0E,0x11,0x13,0x15,0x19,0x11,0x0E},
-    {0x04,0x0C,0x04,0x04,0x04,0x04,0x0E},
-    {0x0E,0x11,0x01,0x02,0x04,0x08,0x1F},
-    {0x1E,0x01,0x01,0x0E,0x01,0x01,0x1E},
-    {0x02,0x06,0x0A,0x12,0x1F,0x02,0x02},
-    {0x1F,0x10,0x1E,0x01,0x01,0x11,0x0E},
-    {0x06,0x08,0x10,0x1E,0x11,0x11,0x0E},
-    {0x1F,0x01,0x02,0x04,0x08,0x08,0x08},
-    {0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E},
-    {0x0E,0x11,0x11,0x0F,0x01,0x02,0x0C},
-    {0x0E,0x11,0x11,0x1F,0x11,0x11,0x11},
-    {0x1E,0x11,0x11,0x1E,0x11,0x11,0x1E},
-    {0x0E,0x11,0x10,0x10,0x10,0x11,0x0E},
-    {0x1C,0x12,0x11,0x11,0x11,0x12,0x1C},
-    {0x1F,0x10,0x10,0x1E,0x10,0x10,0x1F},
-    {0x1F,0x10,0x10,0x1E,0x10,0x10,0x10},
-    {0x0E,0x11,0x10,0x17,0x11,0x11,0x0F},
-    {0x11,0x11,0x11,0x1F,0x11,0x11,0x11},
-    {0x0E,0x04,0x04,0x04,0x04,0x04,0x0E},
-    {0x07,0x02,0x02,0x02,0x02,0x12,0x0C},
-    {0x11,0x12,0x14,0x18,0x14,0x12,0x11},
-    {0x10,0x10,0x10,0x10,0x10,0x10,0x1F},
-    {0x11,0x1B,0x15,0x15,0x11,0x11,0x11},
-    {0x11,0x11,0x19,0x15,0x13,0x11,0x11},
-    {0x0E,0x11,0x11,0x11,0x11,0x11,0x0E},
-    {0x1E,0x11,0x11,0x1E,0x10,0x10,0x10},
-    {0x0E,0x11,0x11,0x11,0x15,0x12,0x0D},
-    {0x1E,0x11,0x11,0x1E,0x14,0x12,0x11},
-    {0x0F,0x10,0x10,0x0E,0x01,0x01,0x1E},
-    {0x1F,0x04,0x04,0x04,0x04,0x04,0x04},
-    {0x11,0x11,0x11,0x11,0x11,0x11,0x0E},
-    {0x11,0x11,0x11,0x11,0x11,0x0A,0x04},
-    {0x11,0x11,0x11,0x15,0x15,0x15,0x0A},
-    {0x11,0x11,0x0A,0x04,0x0A,0x11,0x11},
-    {0x11,0x11,0x0A,0x04,0x04,0x04,0x04},
-    {0x1F,0x01,0x02,0x04,0x08,0x10,0x1F},
-    {0x00,0x00,0x00,0x00,0x00,0x00,0x00},
-    {0x00,0x00,0x00,0x00,0x00,0x0C,0x0C},
-    {0x00,0x0C,0x0C,0x00,0x0C,0x0C,0x00},
-    {0x00,0x00,0x00,0x1F,0x00,0x00,0x00},
-    {0x00,0x00,0x00,0x00,0x00,0x00,0x1F},
-    {0x04,0x04,0x04,0x04,0x04,0x00,0x04},
-    {0x0E,0x11,0x01,0x02,0x04,0x00,0x04},
-    {0x0E,0x08,0x08,0x08,0x08,0x08,0x0E},
-    {0x0E,0x02,0x02,0x02,0x02,0x02,0x0E},
-    {0x02,0x04,0x08,0x08,0x08,0x04,0x02},
-    {0x08,0x04,0x02,0x02,0x02,0x04,0x08},
-    {0x00,0x04,0x04,0x1F,0x04,0x04,0x00},
-    {0x01,0x01,0x02,0x04,0x08,0x10,0x10},
-    {0x04,0x04,0x04,0x04,0x04,0x04,0x04},
-    {0x0A,0x0A,0x1F,0x0A,0x1F,0x0A,0x0A},
-    {0x00,0x15,0x0E,0x1F,0x0E,0x15,0x00}
-};
-static CGFloat pxWidth(NSString *s, CGFloat sc) { return s.length ? (s.length * 6 - 1) * sc : 0; }
-static void pxText(CGContextRef c, NSString *s, CGFloat x, CGFloat y, CGFloat sc, CGFloat al) {   // белый текст с чёрной тенью
-    CGMutablePathRef p = CGPathCreateMutable();
-    for (NSUInteger i = 0; i < s.length; i++) {
-        unichar ch = [s characterAtIndex:i]; if (ch < 128) ch = (unichar)toupper((int)ch);
-        const char *q = (ch > 0 && ch < 128) ? strchr(PX_SET, (int)ch) : NULL;
-        if (!q) q = strchr(PX_SET, '?');   // символы вне набора (кириллица и т.п.) -> '?'
-        const uint8_t *g = PX_G[q - PX_SET];
-        for (int r = 0; r < 7; r++) for (int cc = 0; cc < 5; cc++)
-            if (g[r] & (16 >> cc)) CGPathAddRect(p, NULL, CGRectMake(x + (i * 6 + cc) * sc, y + r * sc, sc, sc));
-    }
-    CGContextSaveGState(c); CGContextTranslateCTM(c, 1, 1);
-    CGContextSetFillColorWithColor(c, [UIColor colorWithWhite:0 alpha:0.85 * al].CGColor); CGContextAddPath(c, p); CGContextFillPath(c);
-    CGContextRestoreGState(c);
-    CGContextSetFillColorWithColor(c, [UIColor colorWithWhite:1 alpha:al].CGColor); CGContextAddPath(c, p); CGContextFillPath(c);
-    CGPathRelease(p);
+// ---------------- текст ESP / хитмаркера (обычный жирный шрифт с тенью) + чёрно-белый градиент ----------------
+static UIFont *esFont(CGFloat sz) {
+    static NSMutableDictionary<NSNumber *, UIFont *> *cache; if (!cache) cache = [NSMutableDictionary new];
+    UIFont *f = cache[@(sz)]; if (!f) { f = [UIFont boldSystemFontOfSize:sz]; cache[@(sz)] = f; } return f;
+}
+static CGFloat esWidth(NSString *t, CGFloat sz) { return [t sizeWithAttributes:@{NSFontAttributeName: esFont(sz)}].width; }
+static void esText(NSString *t, CGFloat x, CGFloat y, CGFloat sz, CGFloat al) {
+    UIFont *f = esFont(sz);
+    [t drawAtPoint:CGPointMake(x + 1, y + 1) withAttributes:@{NSFontAttributeName: f, NSForegroundColorAttributeName: [UIColor colorWithWhite:0 alpha:0.85 * al]}];
+    [t drawAtPoint:CGPointMake(x, y) withAttributes:@{NSFontAttributeName: f, NSForegroundColorAttributeName: [UIColor colorWithWhite:1 alpha:al]}];
 }
 static CGGradientRef bwGrad() {   // 0 = чёрный, 1 = белый
     static CGGradientRef g; if (!g) {
@@ -477,18 +428,18 @@ static CGGradientRef bwGrad() {   // 0 = чёрный, 1 = белый
 - (void)drawRect:(CGRect)r {
     CGContextRef c = UIGraphicsGetCurrentContext(); CGSize S = self.bounds.size;
     if (C.hitm) {
-        double age = CACurrentMediaTime() - g_hitTime; CGFloat cx = S.width / 2, cy = S.height / 2, a = 8, b = 20;
+        double age = CACurrentMediaTime() - g_hitTime; CGFloat cx = S.width / 2, cy = S.height / 2, a = 4, b = 10;
         if (age < 0.25) {
-            CGContextSetStrokeColorWithColor(c, UIColor.whiteColor.CGColor); CGContextSetLineWidth(c, 2);
+            CGContextSetStrokeColorWithColor(c, UIColor.whiteColor.CGColor); CGContextSetLineWidth(c, 1);
             for (int sx = -1; sx <= 1; sx += 2) for (int sy = -1; sy <= 1; sy += 2) {
                 CGContextMoveToPoint(c, cx + sx * a, cy + sy * a); CGContextAddLineToPoint(c, cx + sx * b, cy + sy * b);
             }
             CGContextStrokePath(c);
         }
         if (age < 0.8) {   // надпись слева от хитмаркера
-            CGFloat al = age > 0.5 ? (0.8 - age) / 0.3 : 1.0;
+            CGFloat al = age > 0.5 ? (0.8 - age) / 0.3 : 1.0, fs = 10;
             NSString *t = [NSString stringWithFormat:@"SHOOT -%d", (int)lroundf(g_hitDmg)];
-            pxText(c, t, cx - b - 10 - pxWidth(t, 2), cy - 7, 2, al);
+            esText(t, cx - b - 5 - esWidth(t, fs), cy - fs * 0.6, fs, al);
         }
     }
     if (g_killNick) {
@@ -550,14 +501,15 @@ static CGGradientRef bwGrad() {   // 0 = чёрный, 1 = белый
         CGFloat hx = shd.x / sw * S.width, hy = (1 - shd.y / sh) * S.height;
         CGFloat bh = fabs(fy - hy), bw = bh * 0.7, x = (fx + hx) / 2 - bw / 2, y = MIN(fy, hy);
         if (bh < 4) continue;
+        { CGFloat mid = y + bh / 2; bh *= 1.15; bw = bh * 0.75; x = (fx + hx) / 2 - bw / 2; y = mid - bh / 2; }   // рамка чуть крупнее
         CGRect box = CGRectMake(x, y, bw, bh); float hp = fmaxf(0, fminf(100, getHP(p)));
         // подложка, чтобы чёрный конец градиента был виден на тёмном фоне
-        CGContextSetStrokeColorWithColor(c, [UIColor colorWithWhite:0.22 alpha:0.7].CGColor); CGContextSetLineWidth(c, 3.5); CGContextStrokeRect(c, box);
+        CGContextSetStrokeColorWithColor(c, [UIColor colorWithWhite:0.22 alpha:0.7].CGColor); CGContextSetLineWidth(c, 3); CGContextStrokeRect(c, box);
         // рамка с градиентом: снизу чёрный -> сверху белый
-        CGContextSaveGState(c); CGContextSetLineWidth(c, 1.5); CGContextAddRect(c, box); CGContextReplacePathWithStrokedPath(c); CGContextClip(c);
+        CGContextSaveGState(c); CGContextSetLineWidth(c, 1.2); CGContextAddRect(c, box); CGContextReplacePathWithStrokedPath(c); CGContextClip(c);
         CGContextDrawLinearGradient(c, bwGrad(), CGPointMake(0, y + bh), CGPointMake(0, y), 0); CGContextRestoreGState(c);
         // хп-бар слева: чёрный снизу, белый сверху
-        CGFloat bx = x - 7, bwid = 3, fh = bh * hp / 100.f;
+        CGFloat bx = x - 6, bwid = 2.5, fh = bh * hp / 100.f;
         CGContextSetFillColorWithColor(c, [UIColor colorWithWhite:0.10 alpha:0.85].CGColor); CGContextFillRect(c, CGRectMake(bx - 1, y - 1, bwid + 2, bh + 2));
         CGContextSaveGState(c); CGContextClipToRect(c, CGRectMake(bx, y + bh - fh, bwid, fh));
         CGContextDrawLinearGradient(c, bwGrad(), CGPointMake(0, y + bh), CGPointMake(0, y), 0); CGContextRestoreGState(c);
@@ -565,10 +517,10 @@ static CGGradientRef bwGrad() {   // 0 = чёрный, 1 = белый
         CGContextStrokeRect(c, CGRectMake(bx - 0.5, y - 0.5, bwid + 1, bh + 1));
         // текст: хп у уровня бара, ник над боксом
         NSString *hs = [NSString stringWithFormat:@"%d", (int)hp];
-        CGFloat hy2 = fmaxf(y - 2, fminf(y + bh - 9, y + bh - fh - 4));
-        pxText(c, hs, bx - 4 - pxWidth(hs, 1.5), hy2, 1.5, 1);
-        NSString *nk = nickOf(p); if (nk.length > 14) nk = [nk substringToIndex:14];
-        pxText(c, nk, x + bw / 2 - pxWidth(nk, 1.5) / 2, y - 13, 1.5, 1);
+        CGFloat hy2 = fmax(y - 2, fmin(y + bh - 8, y + bh - fh - 4));
+        esText(hs, bx - 3 - esWidth(hs, 8), hy2, 8, 1);
+        NSString *nk = nickOf(p); if (nk.length > 16) nk = [nk substringToIndex:16];
+        esText(nk, x + bw / 2 - esWidth(nk, 9) / 2, y - 13, 9, 1);
     }
     bc("idle");
 }
@@ -793,6 +745,7 @@ static void buildUI() {
     { // ANTI-AIM
         UIView *pg = g_pages[1]; UIView *g = gsGroup(pg, @"anti-aim", 8, CW); CGFloat y = 14;
         y = gsCheck(g, y, "Enabled", &C.aa);
+        y = gsCheck(g, y, "Show on own model (camera stays)", &C.ownAA);
         y = gsCombo(g, y, "Mode", &C.aaMode, @[@"Jitter", @"Spin", @"Static", @"Random"]);
         y = gsSlider(g, y, "Pitch (90 = down)", &C.aaPitch, -90, 90, 5, @"%.0f°");
         y = gsSlider(g, y, "Yaw offset", &C.aaBase, 0, 360, 5, @"%.0f°");
@@ -941,6 +894,7 @@ static void installPatches() {
     patchMI("CM.Start",   il_class_get_method(cm, "Start", 0),     RVA_CM_Start,     (void *)h_Start);      report();
     patchMI("CM.Destroy", il_class_get_method(cm, "OnDestroy", 0), RVA_CM_OnDestroy, (void *)h_Destroy);    report();
     patchMI("CM.Update",  il_class_get_method(cm, "Update", 0),    RVA_CM_Update,    (void *)h_Update);     report();
+    g_hasLate = patchMI("CM.Late", il_class_get_method(cm, "LateUpdate", 0), 0, (void *)h_Late); report();
     patchVT("DR.Damage",  dr, il_class_get_method(dr, "Damage", 2), RVA_DR_Damage,   (void *)h_Damage);     report();
     patchVT("CM.Serialize", cm, il_class_get_method(cm, "OnPhotonSerializeView", 2), RVA_CM_Serialize, (void *)h_Ser); report();
     { void *ps = findClassAny("PhotonStream"); patchMI("PS.SendNext", ps ? il_class_get_method(ps, "SendNext", 1) : NULL, RVA_PS_SendNext, (void *)h_SendNext); report(); }
@@ -992,10 +946,44 @@ static Quat w_glr(void *t) { return ((Quat (*)(void *, void *))m_glrot.fn)(t, m_
 static void w_slr(void *t, Quat q) { ((void (*)(void *, Quat, void *))m_slrot.fn)(t, q, m_slrot.mi); }
 static NSString *objName(void *o) { return (m_name.fn && o) ? il2cppStr(((void *(*)(void *, void *))m_name.fn)(o, m_name.mi)) : @"?"; }
 
-// ---------- хелперы иерархии (для debug dump) ----------
+// ---------- хелперы иерархии ----------
 static bool ssApiOK() { return m_childCnt.fn && m_getChild.fn && m_glrot.fn && m_slrot.fn && m_parent.fn && Comp_get_tr; }
 static bool ssHasCam(void *c, void *camTr) {   // камера лежит внутри этого трансформа?
     void *t = camTr; for (int d = 0; d < 16 && t; d++) { if (t == c) return true; t = w_parent(t); } return false;
+}
+static bool g_ssActive; static void *g_ssRoot; static void *g_ssKid[16]; static Quat g_ssBase[16]; static int g_ssN;
+static double g_ssT; static float g_ownSpin;
+static void ssRestore() {
+    for (int i = 0; i < g_ssN; i++) if (g_ssKid[i]) w_slr(g_ssKid[i], g_ssBase[i]);
+    g_ssActive = false; g_ssN = 0; g_ssRoot = NULL;
+}
+// показываем на своей модели тот же yaw/pitch, что уходит по сети (камера не крутится)
+static void applyOwnAA(void *root) {
+    if (!ssApiOK()) return;
+    if (!(C.aa && C.ownAA)) { if (g_ssActive) ssRestore(); g_ssT = 0; return; }
+    void *rt = Comp_get_tr(root); if (!rt) return;
+    double now = CACurrentMediaTime(); float dt = g_ssT > 0 ? (float)(now - g_ssT) : 0; g_ssT = now; if (dt > 0.1f) dt = 0.1f;
+    float yaw;
+    if (C.aaMode == 1) { g_ownSpin = fmodf(g_ownSpin + C.aaSpin * g_serRate * dt, 360.f); yaw = C.aaBase + g_ownSpin; }   // спин плавно, как у других
+    else yaw = g_aaLastYaw;
+    int n = w_childCnt(rt); if (n > 16) n = 16; if (n <= 0) return;
+    if (g_ssRoot != rt || g_ssN != n) {   // (пере)захват базовых поворотов
+        void *nk[16]; Quat nb[16];
+        for (int i = 0; i < n; i++) {
+            void *c = w_getChild(rt, i); nk[i] = c; nb[i] = c ? w_glr(c) : (Quat){0, 0, 0, 1};
+            if (g_ssRoot == rt) for (int j = 0; j < g_ssN; j++) if (g_ssKid[j] == c) nb[i] = g_ssBase[j];
+        }
+        memcpy(g_ssKid, nk, sizeof(void *) * n); memcpy(g_ssBase, nb, sizeof(Quat) * n); g_ssN = n; g_ssRoot = rt;
+    }
+    void *cam = pickCamera(); void *camTr = cam ? Comp_get_tr(cam) : NULL;
+    float ya = yaw * (float)M_PI / 180.f, pa = C.aaPitch * (float)M_PI / 180.f;
+    Quat qy = {0, sinf(ya / 2), 0, cosf(ya / 2)}, qx = {sinf(pa / 2), 0, 0, cosf(pa / 2)};
+    for (int i = 0; i < n; i++) {
+        void *c = g_ssKid[i]; if (!c) continue;
+        if (camTr && ssHasCam(c, camTr)) continue;   // ветку с камерой не трогаем
+        w_slr(c, qmul(qy, qmul(g_ssBase[i], qx)));
+    }
+    g_ssActive = true;
 }
 static void dumpHierarchy() {
     [g_snText setString:@""];
