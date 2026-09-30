@@ -6,6 +6,7 @@
 #include <mach-o/dyld.h>
 #include <dlfcn.h>
 #include <math.h>
+#include <initializer_list>
 #include <string.h>
 #include <stdint.h>
 #include <ctype.h>
@@ -43,6 +44,23 @@ static struct {
     bool  aspectOn  = false;  // растянутое разрешение
     float aspect    = 1.33f;  // пропорция камеры (4:3 = 1.33)
     bool  dist      = true;   // дистанция под ESP
+    bool  lines     = true;   // линии от низа экрана к ногам врагов
+    int   lineOrg   = 0;      // старт линий: 0 низ, 1 центр, 2 верх
+    float lineW     = 1.0f;   // толщина линий (pt)
+    float lineC[3]  = {0, 0, 1};   // цвет линий (HSV), по умолчанию белый
+    bool  corner    = false;  // угловые рамки вместо цельной
+    float cnTop[3]  = {0, 0, 1}, cnBot[3] = {0.58f, 0.8f, 1};   // градиент угловых рамок (HSV): верх / низ
+    bool  weapon    = true;   // иконка оружия справа от рамки
+    bool  arrows    = true;   // стрелки к врагам вне экрана
+    float arrC[3]   = {0, 0, 1};   // цвет стрелок
+    float arrSize   = 10.f;   // размер стрелок
+    bool  xhair     = false;  // свой прицел
+    int   xhShape   = 0;      // 0 крест, 1 точка, 2 круг, 3 квадрат, 4 X, 5 ромб
+    float xhC[3]    = {0.33f, 1, 1};   // цвет прицела
+    float xhSize = 8.f, xhThick = 1.f, xhGap = 3.f;
+    bool  tracers   = true;   // трассеры своих пуль
+    float trC[3]    = {0.55f, 0.6f, 1};   // цвет трассеров
+    float trW       = 0.7f;   // толщина ядра трассера
     bool  hpbar     = true;   // хп-бар у ESP
     bool  glow      = true;   // свечение вокруг ESP-рамки
     bool  sparks    = true;   // искры при убийстве
@@ -270,12 +288,28 @@ static void applyAspect() {   // растянутое разрешение: по
     if (C.aspectOn) { void *cam = pickCamera(); if (cam) { Cam_setAsp(cam, fmaxf(0.5f, C.aspect)); g_aspOn = true; } }
     else if (g_aspOn) { void *cam = pickCamera(); if (cam && Cam_resetAsp) Cam_resetAsp(cam); g_aspOn = false; }
 }
+// ---------------- трассеры своих пуль ----------------
+struct Tracer { void *bul; Vec3 a, b; double last; bool used; };
+static Tracer g_tr[48]; static int g_myVid = -1;
+static void trackBullet(void *bul) {
+    void *tr = *(void **)((uintptr_t)bul + OFF_BUL_Tr); if (!tr || !Tr_get_pos) return;
+    Vec3 p; Tr_get_pos(tr, &p); if (!isfinite(p.x + p.y + p.z)) return;
+    double now = CACurrentMediaTime(); Tracer *e = NULL, *fr = NULL, *oldest = &g_tr[0];
+    for (int i = 0; i < 48; i++) {
+        Tracer &t = g_tr[i];
+        if (t.used && t.bul == bul && now - t.last < 0.12) { e = &t; break; }
+        if (!t.used || now - t.last > 1.0) { if (!fr) fr = &t; }
+        if (t.last < oldest->last) oldest = &t;
+    }
+    if (!e) { e = fr ? fr : oldest; e->bul = bul; e->a = p; e->used = true; }
+    e->b = p; e->last = now;
+}
 static float g_baseSpeed, g_lastShoot; static int g_lastFrags = -1; static double g_dtT; static int g_dtLog;
 static void h_Update(void *self, void *mi) {
     fn_v_t o = (fn_v_t)origOf(mi); if (o) o(self, mi);
     if (!g_local && isMine(self)) g_local = self;
     if (self != g_local) return;
-    g_gameFrames++;
+    g_gameFrames++; g_myVid = viewID(self);
     bc("tgt"); updateTarget(); bc("vis"); applyVisuals(); bc("kill"); trackDeaths(); bc("idle");
 
     void *pwm = *(void **)((uintptr_t)self + OFF_CM_PWM);
@@ -346,6 +380,7 @@ static void h_BulUpdate(void *self, void *mi) {
         }
     }
     fn_v_t o = (fn_v_t)origOf(mi); if (o) o(self, mi);
+    if (C.tracers && g_local && g_myVid >= 0 && *(int *)((uintptr_t)self + OFF_BUL_Owner) == g_myVid) trackBullet(self);
 }
 
 // хитмаркер / хитсаунд (DamageReciver2.Damage, vtable)
@@ -450,6 +485,101 @@ static CGGradientRef bwGrad() {   // 0 = чёрный, 1 = белый
     } return g;
 }
 
+// ---------------- иконки оружия / стрелки / прицел ----------------
+static NSString *clsName(void *o) {
+    if (!o || !il2cpp_object_get_class || !il2cpp_class_get_name) return @"";
+    void *k = il2cpp_object_get_class(o); const char *n = k ? il2cpp_class_get_name(k) : NULL;
+    return n ? [NSString stringWithUTF8String:n] : @"";
+}
+static bool hasAny(NSString *k, NSArray<NSString *> *ws) { for (NSString *w in ws) if ([k containsString:w]) return true; return false; }
+static int wpnKind(void *p) {   // 0 пистолет, 1 винтовка, 2 смг, 3 дробовик, 4 снайперка, 5 гранатомёт; -1 нет оружия
+    void *pwm = *(void **)((uintptr_t)p + OFF_CM_PWM); void *w = pwm ? *(void **)((uintptr_t)pwm + OFF_PWM_Weapon) : NULL;
+    if (!w) return -1;
+    void *gi = *(void **)((uintptr_t)w + OFF_W_GunInfo);
+    NSString *k = [[NSString stringWithFormat:@"%@ %@", clsName(w), clsName(gi)] lowercaseString];
+    static NSMutableSet *seen; if (!seen) seen = [NSMutableSet new];
+    if (![seen containsObject:k] && seen.count < 24) { [seen addObject:k]; NSLog(@"[WPN] %@", k); }   // что реально читается: смотри в логе
+    if (hasAny(k, @[@"rpg", @"bazooka", @"launcher", @"rocket", @"grenade"])) return 5;
+    if (hasAny(k, @[@"sniper", @"awp", @"barrett", @"dragunov", @"scout"])) return 4;
+    if (hasAny(k, @[@"shot", @"spas", @"sawed", @"pump"])) return 3;
+    if (hasAny(k, @[@"smg", @"uzi", @"mp5", @"mp7", @"mac", @"p90", @"vector", @"tommy"])) return 2;
+    if (hasAny(k, @[@"pistol", @"deagle", @"desert", @"revolver", @"glock", @"usp", @"colt", @"magnum"])) return 0;
+    return 1;
+}
+static void drawWpnIcon(CGContextRef c, int kind, CGFloat x, CGFloat cy, CGFloat bh) {
+    if (kind < 0) return;
+    CGFloat ih = fmin(14, fmax(6, bh * 0.22)), s = ih / 10.0;
+    CGMutablePathRef P = CGPathCreateMutable();
+    auto addR = [&](CGFloat a, CGFloat b, CGFloat w, CGFloat h) { CGPathAddRect(P, NULL, CGRectMake(a, b, w, h)); };
+    auto addQ = [&](std::initializer_list<CGPoint> pts) {
+        bool first = true;
+        for (CGPoint q : pts) { if (first) CGPathMoveToPoint(P, NULL, q.x, q.y); else CGPathAddLineToPoint(P, NULL, q.x, q.y); first = false; }
+        CGPathCloseSubpath(P);
+    };
+    switch (kind) {
+        case 0: addR(3, 1, 18, 3.4); addQ({{5, 4.4}, {11, 4.4}, {9.5, 9.6}, {5.7, 9.6}}); addR(11, 4.4, 4, 1.3); break;
+        case 2: addR(5, 2.8, 11, 3.2); addR(16, 3.5, 5, 1.4); addR(0.5, 3, 4.5, 1.6); addR(9, 6, 2.6, 4); addQ({{5.5, 6}, {8, 6}, {7.4, 9.4}, {5.6, 9.4}}); addR(11, 1.9, 3.5, 0.9); break;
+        case 3: addR(9, 2.6, 14.5, 1.6); addR(11, 4.3, 7, 1.5); addR(5.5, 2.6, 5, 3.2); addQ({{0, 2.6}, {5.5, 2.6}, {5.5, 6}, {2, 7.8}, {0, 6.5}}); break;
+        case 4: addR(11, 4, 12.5, 1.2); addR(4, 3, 8, 2.8); addR(7.5, 0.4, 7.5, 1.7); addR(9.5, 2, 1, 1.1); addR(13, 2, 1, 1.1);
+                addQ({{0, 3}, {4, 3}, {4, 6}, {1, 7.6}, {0, 5.6}}); addQ({{7, 5.8}, {9.5, 5.8}, {8.8, 9.2}, {6.8, 9.2}}); break;
+        case 5: addR(2, 2.4, 19, 3.4); addQ({{21, 2}, {23.8, 0.8}, {23.8, 7.4}, {21, 6.2}}); addQ({{8, 5.8}, {10.6, 5.8}, {9.8, 9.6}, {7.4, 9.6}}); break;
+        default: addR(6, 2.6, 12, 3.2); addR(18, 3.3, 6, 1.5); addQ({{0, 2.4}, {6, 2.6}, {6, 6}, {2, 7.6}, {0, 6}});
+                 addQ({{10.5, 5.8}, {14, 5.8}, {13.2, 9.8}, {10, 9.6}}); addR(12, 1.6, 4, 1); break;
+    }
+    CGAffineTransform t = CGAffineTransformMake(s, 0, 0, s, x, cy - ih / 2);
+    CGPathRef tp = CGPathCreateCopyByTransformingPath(P, &t);
+    CGContextSaveGState(c); CGContextSetLineJoin(c, kCGLineJoinRound);
+    CGContextAddPath(c, tp); CGContextSetRGBStrokeColor(c, 0, 0, 0, 0.85f); CGContextSetLineWidth(c, 2); CGContextStrokePath(c);
+    CGContextAddPath(c, tp); CGContextSetRGBFillColor(c, 1, 1, 1, 1); CGContextFillPath(c);
+    CGContextRestoreGState(c); CGPathRelease(tp); CGPathRelease(P);
+}
+static void drawArrow(CGContextRef c, CGSize S, CGFloat dx, CGFloat dy, float dist) {   // стрелка на окружности вокруг центра экрана
+    CGFloat L = hypot(dx, dy); if (L < 1) { dx = 0; dy = 1; L = 1; } dx /= L; dy /= L;
+    CGFloat R = fmin(S.width, S.height) * 0.40, s = C.arrSize, cx = S.width / 2 + dx * R, cy = S.height / 2 + dy * R, nx = -dy, ny = dx;
+    CGFloat al = fmax(0.45, fmin(1.0, 1.0 - dist / 200.0)); Col k = hsvCol(C.arrC);
+    CGPoint T = {cx + dx * s * 1.2, cy + dy * s * 1.2}, A = {cx - dx * s * 0.6 + nx * s * 0.8, cy - dy * s * 0.6 + ny * s * 0.8};
+    CGPoint Bp = {cx - dx * s * 0.6 - nx * s * 0.8, cy - dy * s * 0.6 - ny * s * 0.8}, N = {cx - dx * s * 0.1, cy - dy * s * 0.1};
+    auto path = [&]() { CGContextMoveToPoint(c, T.x, T.y); CGContextAddLineToPoint(c, A.x, A.y); CGContextAddLineToPoint(c, N.x, N.y); CGContextAddLineToPoint(c, Bp.x, Bp.y); CGContextClosePath(c); };
+    CGContextSaveGState(c); CGContextSetLineJoin(c, kCGLineJoinRound);
+    CGContextSetBlendMode(c, kCGBlendModePlusLighter);
+    CGContextSetRGBStrokeColor(c, k.r, k.g, k.b, 0.10f * al); CGContextSetLineWidth(c, 8); path(); CGContextStrokePath(c);
+    CGContextSetRGBStrokeColor(c, k.r, k.g, k.b, 0.20f * al); CGContextSetLineWidth(c, 4); path(); CGContextStrokePath(c);
+    CGContextSetBlendMode(c, kCGBlendModeNormal);
+    CGContextSetRGBFillColor(c, k.r, k.g, k.b, al); path(); CGContextFillPath(c);
+    CGContextSetRGBStrokeColor(c, 0, 0, 0, 0.6f * al); CGContextSetLineWidth(c, 1); path(); CGContextStrokePath(c);
+    CGContextRestoreGState(c);
+}
+static void drawCrosshair(CGContextRef c, CGSize S) {
+    CGFloat cx = S.width / 2, cy = S.height / 2, s = C.xhSize, t = C.xhThick, g = C.xhGap, d1 = g * 0.7071, d2 = (g + s) * 0.7071; Col k = hsvCol(C.xhC);
+    CGContextSaveGState(c); CGContextSetLineJoin(c, kCGLineJoinMiter);
+    for (int pass = 0; pass < 2; pass++) {   // проход 0: чёрная обводка, проход 1: цвет
+        CGFloat w = pass == 0 ? t + 2 : t;
+        if (pass == 0) { CGContextSetRGBStrokeColor(c, 0, 0, 0, 0.75f); CGContextSetRGBFillColor(c, 0, 0, 0, 0.75f); }
+        else { CGContextSetRGBStrokeColor(c, k.r, k.g, k.b, 1); CGContextSetRGBFillColor(c, k.r, k.g, k.b, 1); }
+        CGContextSetLineWidth(c, w); CGContextSetLineCap(c, pass == 0 ? kCGLineCapSquare : kCGLineCapButt);
+        switch (C.xhShape) {
+            case 0:
+                CGContextMoveToPoint(c, cx - g, cy); CGContextAddLineToPoint(c, cx - g - s, cy);
+                CGContextMoveToPoint(c, cx + g, cy); CGContextAddLineToPoint(c, cx + g + s, cy);
+                CGContextMoveToPoint(c, cx, cy - g); CGContextAddLineToPoint(c, cx, cy - g - s);
+                CGContextMoveToPoint(c, cx, cy + g); CGContextAddLineToPoint(c, cx, cy + g + s);
+                CGContextStrokePath(c); break;
+            case 1: { CGFloat r = fmax(1, s * 0.3) + (pass == 0 ? 1 : 0); CGContextFillEllipseInRect(c, CGRectMake(cx - r, cy - r, r * 2, r * 2)); break; }
+            case 2: CGContextStrokeEllipseInRect(c, CGRectMake(cx - s, cy - s, s * 2, s * 2)); break;
+            case 3: CGContextStrokeRect(c, CGRectMake(cx - s, cy - s, s * 2, s * 2)); break;
+            case 4:
+                for (int sx = -1; sx <= 1; sx += 2) for (int sy = -1; sy <= 1; sy += 2) {
+                    CGContextMoveToPoint(c, cx + sx * d1, cy + sy * d1); CGContextAddLineToPoint(c, cx + sx * d2, cy + sy * d2);
+                }
+                CGContextStrokePath(c); break;
+            default:
+                CGContextMoveToPoint(c, cx, cy - s); CGContextAddLineToPoint(c, cx + s, cy); CGContextAddLineToPoint(c, cx, cy + s); CGContextAddLineToPoint(c, cx - s, cy);
+                CGContextClosePath(c); CGContextStrokePath(c); break;
+        }
+    }
+    CGContextRestoreGState(c);
+}
+
 @interface ESPView : UIView @end
 @implementation ESPView
 - (void)drawRect:(CGRect)r {
@@ -516,22 +646,64 @@ static CGGradientRef bwGrad() {   // 0 = чёрный, 1 = белый
         }
         if (!alive_n) g_nSparks = 0;
     }
+    if (C.xhair) drawCrosshair(c, S);
+    if (C.tracers && Cam_w2s && Scr_w && Scr_h) {   // тонкие светящиеся трассеры своих пуль
+        void *cam = pickCamera(); float sw = Scr_w(), sh = Scr_h(); double now = CACurrentMediaTime(); Col tc = hsvCol(C.trC);
+        if (cam && sw > 1 && sh > 1) {
+            CGContextSaveGState(c); CGContextSetBlendMode(c, kCGBlendModePlusLighter); CGContextSetLineCap(c, kCGLineCapRound);
+            for (int i = 0; i < 48; i++) {
+                Tracer &t = g_tr[i]; if (!t.used) continue;
+                double idle = now - t.last; float al = idle < 0.08 ? 1.f : 1.f - (float)((idle - 0.08) / 0.35);
+                if (al <= 0) { t.used = false; continue; }
+                Vec3 a = t.a, b = t.b, sa, sb; Cam_w2s(cam, &a, 2, &sa); Cam_w2s(cam, &b, 2, &sb);
+                if (sa.z <= 0 || sb.z <= 0) continue;
+                CGPoint p0 = CGPointMake(sa.x / sw * S.width, (1 - sa.y / sh) * S.height), p1 = CGPointMake(sb.x / sw * S.width, (1 - sb.y / sh) * S.height);
+                CGContextSetRGBStrokeColor(c, tc.r, tc.g, tc.b, 0.10f * al); CGContextSetLineWidth(c, 6);   // внешнее свечение
+                CGContextMoveToPoint(c, p0.x, p0.y); CGContextAddLineToPoint(c, p1.x, p1.y); CGContextStrokePath(c);
+                CGContextSetRGBStrokeColor(c, tc.r, tc.g, tc.b, 0.25f * al); CGContextSetLineWidth(c, 3);   // внутреннее свечение
+                CGContextMoveToPoint(c, p0.x, p0.y); CGContextAddLineToPoint(c, p1.x, p1.y); CGContextStrokePath(c);
+                CGContextSetRGBStrokeColor(c, fminf(1, tc.r * 0.6f + 0.4f), fminf(1, tc.g * 0.6f + 0.4f), fminf(1, tc.b * 0.6f + 0.4f), al); CGContextSetLineWidth(c, C.trW);   // тонкое яркое ядро
+                CGContextMoveToPoint(c, p0.x, p0.y); CGContextAddLineToPoint(c, p1.x, p1.y); CGContextStrokePath(c);
+            }
+            CGContextRestoreGState(c);
+        }
+    }
     if (!C.esp || !g_local || !Cam_w2s || !Scr_w || !Scr_h) return;
     bc("esp"); void *cam = pickCamera(); if (!cam) { bc("idle"); return; }
     float sw = Scr_w(), sh = Scr_h(); if (sw < 1 || sh < 1) { bc("idle"); return; }
     NSArray *all; @synchronized (g_players) { all = g_players.allObjects; }
+    CGGradientRef gCn = mkGrad(C.cnTop, C.cnBot);
     CGGradientRef gBox = mkGrad(C.boxTop, C.boxBot), gBar = mkGrad(C.barTop, C.barBot); Col glowC = hsvCol(C.boxTop); Vec3 myPos = posOf(g_local);
     for (NSNumber *n in all) {
         void *p = (void *)n.unsignedLongValue; if (p == g_local || !alive(p)) continue;
         Vec3 f = posOf(p), h = f; h.y += C.headH * scaleOf(p) * 1.3f;
         Vec3 sf, shd; Cam_w2s(cam, &f, 2, &sf); Cam_w2s(cam, &h, 2, &shd);
-        if (sf.z <= 0 || shd.z <= 0) continue;
+        bool behind = sf.z <= 0 || shd.z <= 0;
         CGFloat fx = sf.x / sw * S.width,  fy = (1 - sf.y / sh) * S.height;
         CGFloat hx = shd.x / sw * S.width, hy = (1 - shd.y / sh) * S.height;
+        CGFloat mx0 = (fx + hx) / 2, my0 = (fy + hy) / 2;
+        if (behind || mx0 < 0 || mx0 > S.width || my0 < 0 || my0 > S.height) {   // вне экрана -> стрелка
+            if (C.arrows) {
+                float ex = f.x - myPos.x, ey = f.y - myPos.y, ez = f.z - myPos.z;
+                CGFloat dx = mx0 - S.width / 2, dy = my0 - S.height / 2; if (behind) { dx = -dx; dy = -dy; }   // за камерой w2s зеркалит x/y
+                drawArrow(c, S, dx, dy, sqrtf(ex * ex + ey * ey + ez * ez));
+            }
+            continue;
+        }
         CGFloat bh = fabs(fy - hy), bw = bh * 0.7, x = (fx + hx) / 2 - bw / 2, y = MIN(fy, hy);
-        if (bh < 4) continue;
+        if (bh < 0.5) continue;   // раньше было < 4 px: из-за этого ESP пропадал на дальних дистанциях
         { CGFloat mid = y + bh / 2; bh *= 1.15; bw = bh * 0.75 * ((C.aspectOn && C.aspect > 0.1f) ? (sw / sh) / C.aspect : 1.f); x = (fx + hx) / 2 - bw / 2; y = mid - bh / 2; }   // рамка чуть крупнее
         CGRect box = CGRectMake(x, y, bw, bh); float hp = fmaxf(0, fminf(100, getHP(p)));
+        if (C.lines) {   // ESP line: от выбранной точки старта к ногам
+            Col lc = hsvCol(C.lineC);
+            CGFloat ox = S.width / 2, oy = C.lineOrg == 1 ? S.height / 2 : (C.lineOrg == 2 ? 0 : S.height);
+            CGContextSaveGState(c); CGContextSetLineCap(c, kCGLineCapRound);
+            CGContextSetRGBStrokeColor(c, 0, 0, 0, 0.55f); CGContextSetLineWidth(c, C.lineW + 1.5f);   // тёмная подложка для читаемости
+            CGContextMoveToPoint(c, ox, oy); CGContextAddLineToPoint(c, fx, fy); CGContextStrokePath(c);
+            CGContextSetRGBStrokeColor(c, lc.r, lc.g, lc.b, 1); CGContextSetLineWidth(c, C.lineW);
+            CGContextMoveToPoint(c, ox, oy); CGContextAddLineToPoint(c, fx, fy); CGContextStrokePath(c);
+            CGContextRestoreGState(c);
+        }
         if (C.glow) {   // мягкое белое свечение: несколько расширяющихся полупрозрачных обводок с аддитивным смешиванием
             CGPathRef gp = CGPathCreateWithRoundedRect(box, 3, 3, NULL);
             CGContextSaveGState(c); CGContextSetBlendMode(c, kCGBlendModePlusLighter); CGContextSetLineJoin(c, kCGLineJoinRound);
@@ -541,11 +713,24 @@ static CGGradientRef bwGrad() {   // 0 = чёрный, 1 = белый
             }
             CGContextRestoreGState(c); CGPathRelease(gp);
         }
+        if (C.corner) {   // угловые рамки с градиентом
+            CGFloat L = fmax(3, fmin(bw, bh) * 0.3), x0 = box.origin.x, y0 = box.origin.y, x1 = x0 + box.size.width, y1 = y0 + box.size.height;
+            auto corners = [&]() {
+                CGContextMoveToPoint(c, x0, y0 + L); CGContextAddLineToPoint(c, x0, y0); CGContextAddLineToPoint(c, x0 + L, y0);
+                CGContextMoveToPoint(c, x1 - L, y0); CGContextAddLineToPoint(c, x1, y0); CGContextAddLineToPoint(c, x1, y0 + L);
+                CGContextMoveToPoint(c, x1, y1 - L); CGContextAddLineToPoint(c, x1, y1); CGContextAddLineToPoint(c, x1 - L, y1);
+                CGContextMoveToPoint(c, x0 + L, y1); CGContextAddLineToPoint(c, x0, y1); CGContextAddLineToPoint(c, x0, y1 - L);
+            };
+            CGContextSetStrokeColorWithColor(c, [UIColor colorWithWhite:0.22 alpha:0.7].CGColor); CGContextSetLineWidth(c, 3.4); corners(); CGContextStrokePath(c);
+            CGContextSaveGState(c); CGContextSetLineWidth(c, 1.6); corners(); CGContextReplacePathWithStrokedPath(c); CGContextClip(c);
+            CGContextDrawLinearGradient(c, gCn, CGPointMake(0, y + bh), CGPointMake(0, y), 0); CGContextRestoreGState(c);
+        } else {
         // подложка, чтобы чёрный конец градиента был виден на тёмном фоне
         CGContextSetStrokeColorWithColor(c, [UIColor colorWithWhite:0.22 alpha:0.7].CGColor); CGContextSetLineWidth(c, 3); CGContextStrokeRect(c, box);
         // рамка с градиентом: снизу чёрный -> сверху белый
         CGContextSaveGState(c); CGContextSetLineWidth(c, 1.2); CGContextAddRect(c, box); CGContextReplacePathWithStrokedPath(c); CGContextClip(c);
         CGContextDrawLinearGradient(c, gBox, CGPointMake(0, y + bh), CGPointMake(0, y), 0); CGContextRestoreGState(c);
+        }
         if (C.hpbar) {
         // хп-бар слева: чёрный снизу, белый сверху
         CGFloat bx = x - 6, bwid = 2.5, fh = bh * hp / 100.f;
@@ -561,13 +746,14 @@ static CGGradientRef bwGrad() {   // 0 = чёрный, 1 = белый
         }
         NSString *nk = nickOf(p); if (nk.length > 16) nk = [nk substringToIndex:16];
         esText(nk, x + bw / 2 - esWidth(nk, 9) / 2, y - 13, 9, 1);
+        if (C.weapon) drawWpnIcon(c, wpnKind(p), x + bw + 5, y + bh / 2, bh);   // значок оружия справа от рамки
         if (C.dist) {   // дистанция под рамкой
             float ddx = f.x - myPos.x, ddy = f.y - myPos.y, ddz = f.z - myPos.z;
             NSString *ds = [NSString stringWithFormat:@"%dm", (int)lroundf(sqrtf(ddx * ddx + ddy * ddy + ddz * ddz))];
             esText(ds, x + bw / 2 - esWidth(ds, 8) / 2, y + bh + 2, 8, 1);
         }
     }
-    CGGradientRelease(gBox); CGGradientRelease(gBar);
+    CGGradientRelease(gBox); CGGradientRelease(gBar); CGGradientRelease(gCn);
     bc("idle");
 }
 @end
@@ -792,7 +978,8 @@ static UIView *g_pop; static float *g_popHSV;
     if (!same && _host) {
         CGRect row = [self convertRect:self.bounds toView:_host]; CGFloat pw = 220, ph = 54;
         CGFloat x = MIN(_host.bounds.size.width - pw - 2, CGRectGetMaxX(row) - pw), y = CGRectGetMaxY(row) + 3;
-        if (y + ph > _host.bounds.size.height) y = CGRectGetMinY(row) - ph - 3;
+        CGFloat visBottom = [_host isKindOfClass:UIScrollView.class] ? ((UIScrollView *)_host).contentOffset.y + _host.bounds.size.height : _host.bounds.size.height;
+        if (y + ph > visBottom) y = CGRectGetMinY(row) - ph - 3;
         UIView *pop = [[UIView alloc] initWithFrame:CGRectMake(x, y, pw, ph)];
         pop.backgroundColor = GSC(17); pop.layer.borderColor = GSC(80).CGColor; pop.layer.borderWidth = 1;
         GSColor *pk = [[GSColor alloc] initWithFrame:CGRectMake(8, 7, pw - 16, 40)]; pk.backgroundColor = UIColor.clearColor; pk.hsv = h;
@@ -818,6 +1005,10 @@ static CGFloat gsCombo(UIView *g, CGFloat y, const char *nm, int *p, NSArray<NSS
 static CGFloat gsFit(UIView *g, CGFloat y) {
     CGRect f = g.frame; f.size.height = y + 6; g.frame = f; return CGRectGetMaxY(f) + 12;
 }
+@interface GSScroll : UIScrollView @end   // страница меню с вертикальной прокруткой; слайдеры и пикеры цвета не отдают жест скроллу
+@implementation GSScroll
+- (BOOL)touchesShouldCancelInContentView:(UIView *)v { return !([v isKindOfClass:GSSlider.class] || [v isKindOfClass:GSColor.class]); }
+@end
 
 static void buildUI() {
     UIWindow *w = keyWin(); if (!w) return; g_h = [MenuH new];
@@ -850,7 +1041,9 @@ static void buildUI() {
         [b addTarget:g_h action:@selector(tab:) forControlEvents:UIControlEventTouchUpInside];
         UIView *bar = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 2, 26)]; bar.backgroundColor = GSC(245); bar.tag = 99; bar.userInteractionEnabled = NO; [b addSubview:bar];
         [g_panel addSubview:b]; [g_tabBtns addObject:b];
-        UIView *pg = [[UIView alloc] initWithFrame:CGRectMake(TAB + 6, HDR + 8, CW, PH - HDR - 16)]; [g_panel addSubview:pg]; [g_pages addObject:pg];
+        GSScroll *pg = [[GSScroll alloc] initWithFrame:CGRectMake(TAB + 6, HDR + 8, CW, PH - HDR - 16)];
+        pg.delaysContentTouches = NO; pg.directionalLockEnabled = YES; pg.showsVerticalScrollIndicator = NO; pg.alwaysBounceHorizontal = NO;
+        [g_panel addSubview:pg]; [g_pages addObject:pg];
     }
 
     { // RAGE
@@ -868,7 +1061,7 @@ static void buildUI() {
         y = gsSlider(g, y, "Pitch (90 = down)", &C.aaPitch, -90, 90, 5, @"%.0f°");
         y = gsSlider(g, y, "Yaw offset", &C.aaBase, 0, 360, 5, @"%.0f°");
         y = gsSlider(g, y, "Jitter / random range", &C.aaOff, 0, 180, 5, @"%.0f°");
-        y = gsSlider(g, y, "Spin speed", &C.aaSpin, 1, 90, 1, @"%.0f°/tick");
+        y = gsSlider(g, y, "Spin speed", &C.aaSpin, 1, 180, 1, @"%.0f°/tick");
         gsFit(g, y);
     }
     { // VISUALS
@@ -876,8 +1069,26 @@ static void buildUI() {
         y0 = y; y = gsCheck(g, y, "ESP box / nick", &C.esp); gsSwatch(g, pg, y0, "Box", C.boxTop, C.boxBot);
         y0 = y; y = gsCheck(g, y, "HP bar", &C.hpbar);       gsSwatch(g, pg, y0, "HP bar", C.barTop, C.barBot);
         y = gsCheck(g, y, "Glow", &C.glow);
+        y0 = y; y = gsCheck(g, y, "Lines", &C.lines); gsSwatch(g, pg, y0, "Lines", C.lineC, NULL);
+        y = gsCombo(g, y, "Line origin", &C.lineOrg, @[@"Bottom", @"Center", @"Top"]);
+        y = gsSlider(g, y, "Line width", &C.lineW, 0.5f, 5.0f, 0.5f, @"%.1f");
         y = gsCheck(g, y, "Distance", &C.dist);
+        y0 = y; y = gsCheck(g, y, "Corner box", &C.corner); gsSwatch(g, pg, y0, "Corner", C.cnTop, C.cnBot);
+        y = gsCheck(g, y, "Weapon icon", &C.weapon);
+        y0 = y; y = gsCheck(g, y, "Off-screen arrows", &C.arrows); gsSwatch(g, pg, y0, "Arrow", C.arrC, NULL);
+        y = gsSlider(g, y, "Arrow size", &C.arrSize, 6, 20, 1, @"%.0f");
         CGFloat ny = gsFit(g, y);
+        g = gsGroup(pg, @"crosshair", ny, CW); y = 14;
+        y0 = y; y = gsCheck(g, y, "Custom crosshair", &C.xhair); gsSwatch(g, pg, y0, "Crosshair", C.xhC, NULL);
+        y = gsCombo(g, y, "Shape", &C.xhShape, @[@"Cross", @"Dot", @"Circle", @"Square", @"X", @"Diamond"]);
+        y = gsSlider(g, y, "Size", &C.xhSize, 2, 20, 1, @"%.0f");
+        y = gsSlider(g, y, "Thickness", &C.xhThick, 0.5f, 4, 0.5f, @"%.1f");
+        y = gsSlider(g, y, "Gap (cross / X)", &C.xhGap, 0, 12, 1, @"%.0f");
+        ny = gsFit(g, y);
+        g = gsGroup(pg, @"tracers", ny, CW); y = 14;
+        y0 = y; y = gsCheck(g, y, "Bullet tracers", &C.tracers); gsSwatch(g, pg, y0, "Tracer", C.trC, NULL);
+        y = gsSlider(g, y, "Core width", &C.trW, 0.3f, 2, 0.1f, @"%.1f");
+        ny = gsFit(g, y);
         g = gsGroup(pg, @"world", ny, CW); y = 14;
         y0 = y; y = gsCheck(g, y, "Fog", &C.fog); gsSwatch(g, pg, y0, "Fog", C.fogC, NULL);
         y0 = y; y = gsCheck(g, y, "Sky", &C.sky); gsSwatch(g, pg, y0, "Sky", C.skyC, NULL);
@@ -926,6 +1137,10 @@ static void buildUI() {
     [g_mark addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:g_h action:@selector(fabPan:)]];
     CADisplayLink *ml = [CADisplayLink displayLinkWithTarget:g_h selector:@selector(markTick:)]; [ml addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
     [w addSubview:g_panel]; [w addSubview:g_mark];
+    for (UIView *pv in g_pages) {   // высота прокрутки = низ последней группы
+        CGFloat m = 0; for (UIView *v in pv.subviews) m = MAX(m, CGRectGetMaxY(v.frame));
+        ((UIScrollView *)pv).contentSize = CGSizeMake(CW, m + 6);
+    }
     selectTab(0);
 }
 
