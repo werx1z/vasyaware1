@@ -5,13 +5,8 @@
 #include <dlfcn.h>
 #include <math.h>
 #include <string.h>
-#if __has_include(<dobby.h>)
-#include <dobby.h>
-#define HOOKRAW(a, r, o) DobbyHook((void *)(a), (void *)(r), (void **)(o))
-#else
-#include <substrate.h>
-#define HOOKRAW(a, r, o) (MSHookFunction((void *)(a), (void *)(r), (void **)(o)), 0)
-#endif
+#include <stdint.h>
+#include <stddef.h>
 
 struct Vec3 { float x, y, z; };
 struct Quat { float x, y, z, w; };
@@ -25,7 +20,6 @@ static struct {
     float aaOff   = 90.f;    // jitter +-
     float headH   = 0.9f;    // высота головы над ногами (умножается на масштаб)
 } C;
-static int YAW_IDX = -1;     // индекс yaw в SendNext. -1 = только лог. Определи по логу [AA]
 
 // ---------------- офсеты ----------------
 #define RVA_CM_Start        0x3D84098
@@ -48,6 +42,8 @@ static int YAW_IDX = -1;     // индекс yaw в SendNext. -1 = только 
 #define OFF_CM_Team    0xF4
 #define OFF_CM_PWM     0xB8
 #define OFF_CM_Scale   0x168
+#define OFF_CM_Frags   0x5C
+#define OFF_CM_LastShoot 0x22C
 #define OFF_PWM_Weapon 0x30
 #define OFF_PWM_Target 0x48
 #define OFF_W_Ammo     0x7C
@@ -89,6 +85,7 @@ static void *(*Cam_main)(void);
 static void *(*Comp_get_tr)(void *);
 static void (*Tr_get_pos)(void *, Vec3 *);
 static void (*Tr_set_rot)(void *, Quat *);
+static void (*Tr_get_rot)(void *, Quat *);
 static void (*Quat_Look)(Vec3 *, Vec3 *, Quat *);
 static void (*Cam_w2s)(void *, Vec3 *, int, Vec3 *);
 static int (*Scr_w)(void), (*Scr_h)(void);
@@ -131,36 +128,77 @@ static void updateTarget() {
     }
 }
 
-// ---------------- хуки ----------------
-static void (*o_Start)(void *, void *);
+// ---------------- таблица оригинальных указателей ----------------
+struct OrigE { void *mi; void *fn; };
+static OrigE g_orig[128]; static int g_nOrig;
+static void regOrig(void *mi, void *fn) { if (g_nOrig < 128) g_orig[g_nOrig++] = (OrigE){mi, fn}; }
+static void *origOf(void *mi) { for (int i = 0; i < g_nOrig; i++) if (g_orig[i].mi == mi) return g_orig[i].fn; return NULL; }
+typedef void (*fn_v_t)(void *, void *);
+typedef void (*fn_dmg_t)(void *, float, int, void *);
+typedef void (*fn_ser_t)(void *, void *, void *, void *);
+
+static Quat qmul(Quat a, Quat b) {
+    return (Quat){ a.w*b.x + a.x*b.w + a.y*b.z - a.z*b.y,
+                   a.w*b.y - a.x*b.z + a.y*b.w + a.z*b.x,
+                   a.w*b.z + a.x*b.y - a.y*b.x + a.z*b.w,
+                   a.w*b.w - a.x*b.x - a.y*b.y - a.z*b.z };
+}
+
+// ---------------- обработчики ----------------
 static void h_Start(void *self, void *mi) {
-    o_Start(self, mi);
+    fn_v_t o = (fn_v_t)origOf(mi); if (o) o(self, mi);
     @synchronized (g_players) { [g_players addObject:@((uintptr_t)self)]; }
     if (isMine(self)) g_local = self;
 }
-static void (*o_Destroy)(void *, void *);
 static void h_Destroy(void *self, void *mi) {
     @synchronized (g_players) { [g_players removeObject:@((uintptr_t)self)]; }
     if (g_local == self) g_local = NULL;
-    o_Destroy(self, mi);
+    fn_v_t o = (fn_v_t)origOf(mi); if (o) o(self, mi);
 }
 
 static void applyVisuals() {
-    if (C.fog && RS_fog) { Col k = {0, 0, 0, 1}; RS_fog(true); RS_fogCol(&k); RS_fogMode(2); RS_fogDens(0.1f); }
-    if (C.sky && Cam_main) {
+    if (C.fog && RS_fog && RS_fogCol && RS_fogMode && RS_fogDens) { Col k = {0, 0, 0, 1}; RS_fog(true); RS_fogCol(&k); RS_fogMode(2); RS_fogDens(0.1f); }
+    if (C.sky && Cam_main && Cam_clear && Cam_bg) {
         if (RS_skybox) RS_skybox(NULL);
         void *cam = Cam_main(); Col k = {0, 0, 0, 1};
         if (cam) { Cam_clear(cam, 2); Cam_bg(cam, &k); }
     }
 }
 
-static float g_baseSpeed;
-static void (*o_Update)(void *, void *);
+static float g_baseSpeed, g_lastShoot; static int g_lastFrags = -1; static double g_dtT; static int g_dtLog;
 static void h_Update(void *self, void *mi) {
-    o_Update(self, mi);
+    fn_v_t o = (fn_v_t)origOf(mi); if (o) o(self, mi);
     if (!g_local && isMine(self)) g_local = self;
     if (self != g_local) return;
     updateTarget(); applyVisuals();
+
+    void *pwm = *(void **)((uintptr_t)self + OFF_CM_PWM);
+    void *w = pwm ? *(void **)((uintptr_t)pwm + OFF_PWM_Weapon) : NULL;
+    if (pwm && C.silent && g_hasTarget) *(Vec3 *)((uintptr_t)pwm + OFF_PWM_Target) = g_aim;
+    if (w && C.nospread) {
+        void *gi = *(void **)((uintptr_t)w + OFF_W_GunInfo);
+        if (gi) { Vec3 *e = (Vec3 *)((uintptr_t)gi + OFF_GI_ErrDelta); e->x = e->y = e->z = 0; }
+    }
+
+    // double tap: выстрел определяем по смене lastShootTime, повторяем PushBullet
+    float lst = *(float *)((uintptr_t)self + OFF_CM_LastShoot);
+    if (lst != g_lastShoot) {
+        bool fresh = g_lastShoot != 0; g_lastShoot = lst;
+        if (g_dtLog < 12) { g_dtLog++; NSLog(@"[DT] lastShootTime=%f", lst); }
+        double now = CACurrentMediaTime();
+        if (C.dtap && fresh && w && *(int *)((uintptr_t)w + OFF_W_Ammo) > 0 && now - g_dtT > 0.08) {
+            g_dtT = now;
+            FN(RVA_CM_PushBullet, void, void *, void *)(self, NULL);
+            g_lastShoot = *(float *)((uintptr_t)self + OFF_CM_LastShoot);
+        }
+    }
+
+    // килсаунд: растёт счётчик фрагов
+    int fc = *(int *)((uintptr_t)self + OFF_CM_Frags);
+    if (g_lastFrags >= 0 && fc > g_lastFrags && C.killsnd) AudioServicesPlaySystemSound(1025);
+    g_lastFrags = fc;
+
+    // bhop
     if (C.bhop) {
         float *sp = (float *)((uintptr_t)self + OFF_CM_Speed);
         if (g_baseSpeed == 0) g_baseSpeed = *sp;
@@ -169,31 +207,10 @@ static void h_Update(void *self, void *mi) {
     } else if (g_baseSpeed != 0) { *(float *)((uintptr_t)self + OFF_CM_Speed) = g_baseSpeed; }
 }
 
-static void prepareShot(void *motor) {
-    void *pwm = *(void **)((uintptr_t)motor + OFF_CM_PWM); if (!pwm) return;
-    void *w = *(void **)((uintptr_t)pwm + OFF_PWM_Weapon); if (!w) return;
-    if (C.nospread) {
-        void *gi = *(void **)((uintptr_t)w + OFF_W_GunInfo);
-        if (gi) { Vec3 *e = (Vec3 *)((uintptr_t)gi + OFF_GI_ErrDelta); e->x = e->y = e->z = 0; }
-    }
-    if (C.silent && g_hasTarget) *(Vec3 *)((uintptr_t)pwm + OFF_PWM_Target) = g_aim;
-}
-static void (*o_Push)(void *, void *);
-static void h_Push(void *self, void *mi) {
-    if (self != g_local) { o_Push(self, mi); return; }
-    prepareShot(self); o_Push(self, mi);
-    if (C.dtap) {
-        void *pwm = *(void **)((uintptr_t)self + OFF_CM_PWM);
-        void *w = pwm ? *(void **)((uintptr_t)pwm + OFF_PWM_Weapon) : NULL;
-        if (w && *(int *)((uintptr_t)w + OFF_W_Ammo) > 0) { prepareShot(self); o_Push(self, mi); }
-    }
-}
-
-// silent aim на самой пуле
+// silent aim на самой пуле (Update у BaseBulletScript и подклассов)
 static int g_bulLog;
-static void (*o_UpdPos)(void *, void *);
-static void h_UpdPos(void *self, void *mi) {
-    if (g_local) {
+static void h_BulUpdate(void *self, void *mi) {
+    if (g_local && C.silent && g_hasTarget) {
         bool orig = *(bool *)((uintptr_t)self + OFF_BUL_Orig);
         int owner = *(int *)((uintptr_t)self + OFF_BUL_Owner);
         float life = *(float *)((uintptr_t)self + OFF_BUL_Life);
@@ -201,7 +218,7 @@ static void h_UpdPos(void *self, void *mi) {
             Vec3 *dir = (Vec3 *)((uintptr_t)self + OFF_BUL_Dir);
             if (g_bulLog < 10) { g_bulLog++; NSLog(@"[BUL] owner=%d dir=%f %f %f", owner, dir->x, dir->y, dir->z); }
             void *tr = *(void **)((uintptr_t)self + OFF_BUL_Tr);
-            if (C.silent && g_hasTarget && tr && Tr_get_pos) {
+            if (tr && Tr_get_pos) {
                 Vec3 p; Tr_get_pos(tr, &p);
                 Vec3 d = {g_aim.x - p.x, g_aim.y - p.y, g_aim.z - p.z};
                 float l = sqrtf(d.x*d.x + d.y*d.y + d.z*d.z);
@@ -212,44 +229,36 @@ static void h_UpdPos(void *self, void *mi) {
             }
         }
     }
-    o_UpdPos(self, mi);
+    fn_v_t o = (fn_v_t)origOf(mi); if (o) o(self, mi);
 }
 
-// хитмаркер / звуки
+// хитмаркер / хитсаунд (DamageReciver2.Damage, vtable)
 static int g_dmgLog;
-static void (*o_Damage)(void *, float, int, void *);
 static void h_Damage(void *self, float dmg, int from, void *mi) {
-    o_Damage(self, dmg, from, mi);
+    fn_dmg_t o = (fn_dmg_t)origOf(mi); if (o) o(self, dmg, from, mi);
     if (g_dmgLog < 15) { g_dmgLog++; NSLog(@"[HIT] dmg=%f from=%d local=%d", dmg, from, g_local ? viewID(g_local) : -1); }
     if (g_local && from == viewID(g_local)) {
         g_hitTime = CACurrentMediaTime();
         if (C.hitsnd) AudioServicesPlaySystemSound(1057);
     }
 }
-static void (*o_Kill)(void *, void *);
-static void h_Kill(void *self, void *mi) {
-    o_Kill(self, mi);
-    if (self == g_local && C.killsnd) AudioServicesPlaySystemSound(1025);
-}
 
-// anti-aim: логируем порядок данных, подменяем yaw по индексу
-static bool g_inSer; static int g_idx;
-static void (*o_Ser)(void *, void *, void *, void *);
+// anti-aim: на время сериализации поворачиваем трансформ, потом возвращаем
+static int g_aaTick;
 static void h_Ser(void *self, void *stream, void *info, void *mi) {
-    g_inSer = self == g_local && *(bool *)((uintptr_t)stream + OFF_PS_Writing); g_idx = 0;
-    o_Ser(self, stream, info, mi); g_inSer = false;
-}
-static int g_aaTick, g_aaLog;
-static void (*o_Send)(void *, void *, void *);
-static void h_Send(void *stream, void *obj, void *mi) {
-    if (g_inSer && obj) {
-        const char *t = il2cpp_class_get_name(il2cpp_object_get_class(obj));
-        bool isF = !strcmp(t, "Single");
-        if (g_aaLog < 60) { g_aaLog++; NSLog(@"[AA] #%d %s %f", g_idx, t, isF ? *(float *)((uintptr_t)obj + 0x10) : 0.f); }
-        if (C.aa && isF && g_idx == YAW_IDX) { g_aaTick++; *(float *)((uintptr_t)obj + 0x10) += (g_aaTick & 1) ? C.aaOff : -C.aaOff; }
-        g_idx++;
+    fn_ser_t o = (fn_ser_t)origOf(mi);
+    void *tr = NULL; Quat saved = {0, 0, 0, 1};
+    if (C.aa && self == g_local && stream && *(bool *)((uintptr_t)stream + OFF_PS_Writing) && Comp_get_tr && Tr_get_rot && Tr_set_rot) {
+        tr = Comp_get_tr(self);
+        if (tr) {
+            Tr_get_rot(tr, &saved); g_aaTick++;
+            float a = ((g_aaTick & 1) ? C.aaOff : -C.aaOff) * (float)M_PI / 180.f;
+            Quat qy = {0, sinf(a / 2), 0, cosf(a / 2)}; Quat q = qmul(qy, saved);
+            Tr_set_rot(tr, &q);
+        }
     }
-    o_Send(stream, obj, mi);
+    if (o) o(self, stream, info, mi);
+    if (tr) Tr_set_rot(tr, &saved);
 }
 
 // ---------------- ESP ----------------
@@ -335,41 +344,119 @@ static void buildUI() {
 }
 
 
-// ---------------- диагностика хуков ----------------
+// ---------------- диагностика ----------------
 static UILabel *g_status;
 static NSMutableSet<NSString *> *g_skip;
-static NSString *skipPath() { return [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject stringByAppendingPathComponent:@"cm_skip.txt"]; }
-static int g_hookOK, g_hookTot;
-static NSString *statePath() {
-    return [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject stringByAppendingPathComponent:@"cm_state.txt"];
-}
-static void writeState(NSString *t) { [t writeToFile:statePath() atomically:YES encoding:NSUTF8StringEncoding error:nil]; }
+static int g_okN, g_totN;
+static NSMutableString *g_fails;
+static NSString *docPath(NSString *n) { return [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject stringByAppendingPathComponent:n]; }
+static void writeState(NSString *t) { [t writeToFile:docPath(@"cm_state.txt") atomically:YES encoding:NSUTF8StringEncoding error:nil]; }
 static void showStatus(NSString *t) { if (g_status) g_status.text = t; NSLog(@"[CM] %@", t); }
-static void doHook(const char *name, uintptr_t addr, void *rep, void **orig) {
-    if ([g_skip containsObject:[NSString stringWithUTF8String:name]]) { NSLog(@"[CM] skip %s", name); return; }
-    g_hookTot++;
-    writeState([NSString stringWithFormat:@"crash-at:%s", name]);   // если игра упадёт на этом хуке, узнаем при следующем запуске
-    int r = HOOKRAW(addr, rep, orig);
-    bool ok = (r == 0 && *orig != NULL);
-    if (ok) g_hookOK++;
-    writeState([NSString stringWithFormat:@"ok:%d/%d last=%s r=%d", g_hookOK, g_hookTot, name, r]);
-    showStatus([NSString stringWithFormat:@"hooks %d/%d (%s %@)", g_hookOK, g_hookTot, name, ok ? @"ok" : @"FAIL"]);
+static void report() { showStatus([NSString stringWithFormat:@"patched %d/%d %@", g_okN, g_totN, g_fails.length ? [@"FAIL: " stringByAppendingString:g_fails] : @"ok"]); }
+static void fail(const char *tag, NSString *why) { [g_fails appendFormat:@"%s(%@) ", tag, why]; NSLog(@"[CM] FAIL %s: %@", tag, why); }
+
+// подмена methodPointer у MethodInfo (Unity вызывает Update/Start/... через runtime_invoke)
+static bool patchMI(const char *tag, void *mi, uintptr_t rva, void *rep) {
+    if ([g_skip containsObject:[NSString stringWithUTF8String:tag]]) { NSLog(@"[CM] skip %s", tag); return false; }
+    g_totN++;
+    if (!mi) { fail(tag, @"no method"); return false; }
+    void *cur = *(void **)mi;
+    if (rva ? ((uintptr_t)cur != B + rva) : (!cur || (uintptr_t)cur < B || (uintptr_t)cur - B > 0x9000000)) { fail(tag, @"ptr mismatch"); return false; }
+    if (origOf(mi)) { g_totN--; return true; }
+    writeState([NSString stringWithFormat:@"crash-at:%s", tag]);
+    regOrig(mi, cur);
+    *(void **)mi = rep;
+    g_okN++;
+    writeState([NSString stringWithFormat:@"ok:%d/%d last=%s", g_okN, g_totN, tag]);
+    return true;
 }
-#define HOOK(rva, rep, orig) doHook(#rep, B + (rva), (void *)(rep), (void **)(orig))
+// подмена записи в vtable класса (виртуальные и интерфейсные вызовы)
+static bool patchVT(const char *tag, void *klass, void *mi, uintptr_t rva, void *rep) {
+    if ([g_skip containsObject:[NSString stringWithUTF8String:tag]]) { NSLog(@"[CM] skip %s", tag); return false; }
+    g_totN++;
+    if (!klass || !mi) { fail(tag, @"no class/method"); return false; }
+    uintptr_t want = B + rva, base = (uintptr_t)klass; int n = 0;
+    writeState([NSString stringWithFormat:@"crash-at:%s", tag]);
+    for (uintptr_t off = 0x100; off < 0x1000; off += 8) {
+        uintptr_t *p = (uintptr_t *)(base + off);
+        if (p[0] == (uintptr_t)mi && p[-1] == want) {
+            if (!origOf(mi)) regOrig(mi, (void *)want);
+            p[-1] = (uintptr_t)rep; n++;
+        }
+    }
+    if (!n) { fail(tag, @"vtable entry not found"); return false; }
+    g_okN++;
+    writeState([NSString stringWithFormat:@"ok:%d/%d last=%s x%d", g_okN, g_totN, tag, n]);
+    return true;
+}
+
+// ---------------- il2cpp API ----------------
+static void *(*il_domain_get)(void);
+static void **(*il_domain_get_assemblies)(void *, size_t *);
+static void *(*il_assembly_get_image)(void *);
+static const char *(*il_image_get_name)(void *);
+static uint32_t (*il_image_get_class_count)(void *);
+static void *(*il_image_get_class)(void *, uint32_t);
+static void *(*il_class_from_name)(void *, const char *, const char *);
+static void *(*il_class_get_method)(void *, const char *, int);
+static void *(*il_class_get_parent)(void *);
+
+static void *findImage() {
+    size_t n = 0; void **as = il_domain_get_assemblies(il_domain_get(), &n);
+    for (size_t i = 0; i < n; i++) {
+        void *img = il_assembly_get_image(as[i]); const char *nm = img ? il_image_get_name(img) : NULL;
+        if (nm && strstr(nm, "Assembly-CSharp")) return img;
+    }
+    return NULL;
+}
+
+static void installPatches() {
+    void *img = findImage();
+    if (!img) { fail("image", @"Assembly-CSharp not found"); report(); return; }
+    void *cm = il_class_from_name(img, "", "CharacterMotor");
+    void *dr = il_class_from_name(img, "", "DamageReciver2");
+    void *bb = il_class_from_name(img, "", "BaseBulletScript");
+    if (!cm || !dr || !bb) { fail("class", @"class not found"); report(); return; }
+
+    patchMI("CM.Start",   il_class_get_method(cm, "Start", 0),     RVA_CM_Start,     (void *)h_Start);      report();
+    patchMI("CM.Destroy", il_class_get_method(cm, "OnDestroy", 0), RVA_CM_OnDestroy, (void *)h_Destroy);    report();
+    patchMI("CM.Update",  il_class_get_method(cm, "Update", 0),    RVA_CM_Update,    (void *)h_Update);     report();
+    patchVT("DR.Damage",  dr, il_class_get_method(dr, "Damage", 2), RVA_DR_Damage,   (void *)h_Damage);     report();
+    patchVT("CM.Serialize", cm, il_class_get_method(cm, "OnPhotonSerializeView", 2), RVA_CM_Serialize, (void *)h_Ser); report();
+
+    patchMI("BUL.Update", il_class_get_method(bb, "Update", 0), 0x3DC0188, (void *)h_BulUpdate);
+    uint32_t cnt = il_image_get_class_count(img); int sub = 0;
+    for (uint32_t i = 0; i < cnt; i++) {
+        void *k = il_image_get_class(img, i); void *p = k; bool isB = false;
+        for (int d = 0; d < 12 && p; d++) { p = il_class_get_parent(p); if (p == bb) { isB = true; break; } }
+        if (!isB) continue;
+        void *mi = il_class_get_method(k, "Update", 0);
+        if (mi && !origOf(mi)) { char tag[32]; snprintf(tag, sizeof tag, "BUL.sub%d", sub++); patchMI(tag, mi, 0, (void *)h_BulUpdate); }
+    }
+    report();
+}
 
 // ---------------- инициализация ----------------
 static void setup() {
     B = getBase("UnityFramework");
     void *h = dlopen(NULL, RTLD_NOW);
-    resolve_icall = (decltype(resolve_icall))dlsym(h, "il2cpp_resolve_icall");
-    il2cpp_object_get_class = (decltype(il2cpp_object_get_class))dlsym(h, "il2cpp_object_get_class");
-    il2cpp_class_get_name = (decltype(il2cpp_class_get_name))dlsym(h, "il2cpp_class_get_name");
-    if (!B || !resolve_icall) { NSLog(@"[CM] base/icall not found, retry"); dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{ setup(); }); return; }
-    g_players = [NSMutableSet new];
-    // Имена icall зависят от версии Unity: при nullptr смотри лог [CM] icall и поправь строку.
+#define SYM(v, n) v = (decltype(v))dlsym(h, n)
+    SYM(resolve_icall, "il2cpp_resolve_icall");
+    SYM(il_domain_get, "il2cpp_domain_get"); SYM(il_domain_get_assemblies, "il2cpp_domain_get_assemblies");
+    SYM(il_assembly_get_image, "il2cpp_assembly_get_image"); SYM(il_image_get_name, "il2cpp_image_get_name");
+    SYM(il_image_get_class_count, "il2cpp_image_get_class_count"); SYM(il_image_get_class, "il2cpp_image_get_class");
+    SYM(il_class_from_name, "il2cpp_class_from_name"); SYM(il_class_get_method, "il2cpp_class_get_method_from_name");
+    SYM(il_class_get_parent, "il2cpp_class_get_parent");
+    if (!B || !resolve_icall || !il_domain_get) {
+        NSLog(@"[CM] base/il2cpp api not found, retry");
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{ setup(); });
+        return;
+    }
+    g_players = [NSMutableSet new]; g_fails = [NSMutableString new];
     ICALL(Cam_main,   "UnityEngine.Camera::get_main()");
     ICALL(Comp_get_tr,"UnityEngine.Component::get_transform()");
     ICALL(Tr_get_pos, "UnityEngine.Transform::get_position_Injected(UnityEngine.Vector3&)");
+    ICALL(Tr_get_rot, "UnityEngine.Transform::get_rotation_Injected(UnityEngine.Quaternion&)");
     ICALL(Tr_set_rot, "UnityEngine.Transform::set_rotation_Injected(UnityEngine.Quaternion&)");
     ICALL(Quat_Look,  "UnityEngine.Quaternion::LookRotation_Injected(UnityEngine.Vector3&,UnityEngine.Vector3&,UnityEngine.Quaternion&)");
     ICALL(Cam_w2s,    "UnityEngine.Camera::WorldToScreenPoint_Injected(UnityEngine.Vector3&,UnityEngine.Camera/MonoOrStereoscopicEye,UnityEngine.Vector3&)");
@@ -382,34 +469,23 @@ static void setup() {
     ICALL(RS_skybox,  "UnityEngine.RenderSettings::set_skybox(UnityEngine.Material)");
     ICALL(Cam_clear,  "UnityEngine.Camera::set_clearFlags(UnityEngine.CameraClearFlags)");
     ICALL(Cam_bg,     "UnityEngine.Camera::set_backgroundColor_Injected(UnityEngine.Color&)");
-    NSLog(@"[CM] icall main=%p tr=%p pos=%p w2s=%p fog=%p sky=%p clear=%p look=%p", Cam_main, Comp_get_tr, Tr_get_pos, Cam_w2s, RS_fog, RS_skybox, Cam_clear, Quat_Look);
+    NSLog(@"[CM] icall main=%p tr=%p pos=%p rot=%p w2s=%p fog=%p sky=%p clear=%p look=%p", Cam_main, Comp_get_tr, Tr_get_pos, Tr_get_rot, Cam_w2s, RS_fog, RS_skybox, Cam_clear, Quat_Look);
 
-    NSString *prev = [NSString stringWithContentsOfFile:statePath() encoding:NSUTF8StringEncoding error:nil];
+    NSString *prev = [NSString stringWithContentsOfFile:docPath(@"cm_state.txt") encoding:NSUTF8StringEncoding error:nil];
     g_skip = [NSMutableSet set];
-    for (NSString *l in [[NSString stringWithContentsOfFile:skipPath() encoding:NSUTF8StringEncoding error:nil] componentsSeparatedByString:@"\n"])
+    for (NSString *l in [[NSString stringWithContentsOfFile:docPath(@"cm_skip.txt") encoding:NSUTF8StringEncoding error:nil] componentsSeparatedByString:@"\n"])
         if (l.length) [g_skip addObject:l];
     if ([prev hasPrefix:@"crash-at:"]) {
         [g_skip addObject:[prev substringFromIndex:9]];
-        [[g_skip.allObjects componentsJoinedByString:@"\n"] writeToFile:skipPath() atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        [[g_skip.allObjects componentsJoinedByString:@"\n"] writeToFile:docPath(@"cm_skip.txt") atomically:YES encoding:NSUTF8StringEncoding error:nil];
     }
     buildUI();
     UIWindow *w = keyWin();
-    g_status = [[UILabel alloc] initWithFrame:CGRectMake(60, 22, 320, 30)];
+    g_status = [[UILabel alloc] initWithFrame:CGRectMake(60, 22, 330, 30)];
     g_status.textColor = UIColor.yellowColor; g_status.font = [UIFont boldSystemFontOfSize:11]; g_status.userInteractionEnabled = NO;
     [w addSubview:g_status];
-    if (prev.length) showStatus([NSString stringWithFormat:@"prev run: %@  | skip: %@", prev, [g_skip.allObjects componentsJoinedByString:@","]]);
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 4 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-    HOOK(RVA_CM_Start,     h_Start,   &o_Start);
-    HOOK(RVA_CM_OnDestroy, h_Destroy, &o_Destroy);
-    HOOK(RVA_CM_Update, h_Update, &o_Update);
-    HOOK(RVA_CM_PushBullet, h_Push, &o_Push);
-    HOOK(RVA_BB_UpdatePos, h_UpdPos, &o_UpdPos);
-    HOOK(RVA_DR_Damage, h_Damage, &o_Damage);
-    HOOK(RVA_CM_MakeKill, h_Kill, &o_Kill);
-    HOOK(RVA_CM_Serialize, h_Ser, &o_Ser);
-    HOOK(RVA_PS_SendNext, h_Send, &o_Send);
-    NSLog(@"[CM] ready, base=%p", (void *)B);
-    });
+    if (prev.length) showStatus([NSString stringWithFormat:@"prev: %@ | skip: %@", prev, [g_skip.allObjects componentsJoinedByString:@","]]);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 4 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{ installPatches(); });
 }
 
 __attribute__((constructor)) static void init() {
