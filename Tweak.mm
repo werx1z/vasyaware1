@@ -1,6 +1,8 @@
 // ChickenMenu - HvH для закрытого лобби. Все офсеты из dump.cs ТВОЕЙ версии игры.
 #import <UIKit/UIKit.h>
 #import <AudioToolbox/AudioToolbox.h>
+#import <AVFoundation/AVFoundation.h>
+#include "sounds.h"   // hit_wav (fatality), kill_wav (odin svinya)
 #include <mach-o/dyld.h>
 #include <dlfcn.h>
 #include <math.h>
@@ -19,7 +21,10 @@ static struct {
     bool fog = true, sky = true, hitm = true, hitsnd = true, killsnd = true, esp = true;
     bool silent = true, nospread = true, dtap = true, bhop = true, aa = false;
     float bhopMul = 1.25f;   // множитель SpeedValue
-    float aaOff   = 90.f;    // jitter +-
+    float aaOff   = 60.f;    // диапазон джиттера +- (градусы)
+    float aaBase  = 180.f;   // базовый поворот (180 = модель смотрит назад)
+    float aaSpin  = 25.f;    // градусов за тик отправки (режим Spin)
+    int   aaMode  = 0;       // 0 jitter, 1 spin, 2 static, 3 random
     float headH   = 0.9f;    // высота головы над ногами (умножается на масштаб)
 } C;
 
@@ -68,6 +73,13 @@ static uintptr_t B;
 static NSMutableSet<NSNumber *> *g_players;
 static void *g_local;
 static double g_hitTime;
+static AVAudioPlayer *g_hitP, *g_killP;
+static void initSounds() {
+    g_hitP  = [[AVAudioPlayer alloc] initWithData:[NSData dataWithBytes:hit_wav length:hit_wav_len] error:nil];
+    g_killP = [[AVAudioPlayer alloc] initWithData:[NSData dataWithBytes:kill_wav length:kill_wav_len] error:nil];
+    g_hitP.volume = 1.0; g_killP.volume = 1.0; [g_hitP prepareToPlay]; [g_killP prepareToPlay];
+}
+static void playSnd(AVAudioPlayer *p) { if (!p) return; p.currentTime = 0; [p play]; }
 
 static uintptr_t getBase(const char *name) {
     for (uint32_t i = 0; i < _dyld_image_count(); i++) {
@@ -206,7 +218,7 @@ static void h_Update(void *self, void *mi) {
 
     // килсаунд: растёт счётчик фрагов
     int fc = *(int *)((uintptr_t)self + OFF_CM_Frags);
-    if (g_lastFrags >= 0 && fc > g_lastFrags && C.killsnd) AudioServicesPlaySystemSound(1025);
+    if (g_lastFrags >= 0 && fc > g_lastFrags && C.killsnd) playSnd(g_killP);
     g_lastFrags = fc;
 
     // bhop
@@ -256,28 +268,64 @@ static void h_Damage(void *self, float dmg, int from, void *mi) {
     if (g_dmgLog < 15) { g_dmgLog++; NSLog(@"[HIT] dmg=%f from=%d local=%d", dmg, from, g_local ? viewID(g_local) : -1); }
     if (g_local && from == viewID(g_local)) {
         g_hitTime = CACurrentMediaTime();
-        if (C.hitsnd) AudioServicesPlaySystemSound(1057);
+        if (C.hitsnd) playSnd(g_hitP);
     }
     bc("idle");
 }
 
 // anti-aim: на время сериализации поворачиваем трансформ, потом возвращаем
-static int g_aaTick;
+static int g_aaTick; static float g_aaSpin;
+static bool g_inSer, g_cap; static int g_snLog; static NSMutableString *g_snText;
+static float aaYawDeg() {
+    float y = C.aaBase;
+    switch (C.aaMode) {
+        case 0: y += (g_aaTick & 1) ? C.aaOff : -C.aaOff; break;                     // jitter
+        case 1: g_aaSpin = fmodf(g_aaSpin + C.aaSpin, 360.f); y += g_aaSpin; break;  // spin
+        case 2: break;                                                                // static
+        case 3: y += ((float)arc4random_uniform(2001) / 1000.f - 1.f) * C.aaOff; break; // random
+    }
+    return y;
+}
 static void h_Ser(void *self, void *stream, void *info, void *mi) {
     fn_ser_t o = (fn_ser_t)origOf(mi);
+    bool ours = self == g_local && stream && *(bool *)((uintptr_t)stream + OFF_PS_Writing);
     void *tr = NULL; Quat saved = {0, 0, 0, 1};
-    if (C.aa && self == g_local && stream && *(bool *)((uintptr_t)stream + OFF_PS_Writing) && Comp_get_tr && Tr_get_rot && Tr_set_rot) {
+    if (C.aa && ours && Comp_get_tr && Tr_get_rot && Tr_set_rot) {
         bc("ser:aa");
         tr = Comp_get_tr(self);
         if (tr) {
             Tr_get_rot(tr, &saved); g_aaTick++;
-            float a = ((g_aaTick & 1) ? C.aaOff : -C.aaOff) * (float)M_PI / 180.f;
+            float a = aaYawDeg() * (float)M_PI / 180.f;
             Quat qy = {0, sinf(a / 2), 0, cosf(a / 2)}; Quat q = qmul(qy, saved);
             Tr_set_rot(tr, &q);
         }
     }
+    if (ours && g_cap) { g_inSer = true; g_snLog = 0; [g_snText setString:@""]; }
     if (o) o(self, stream, info, mi);
+    if (g_inSer) { g_inSer = false; g_cap = false; }
     if (tr) { Tr_set_rot(tr, &saved); bc("idle"); }
+}
+
+// диагностика: что именно игра пишет в поток при синхронизации (PhotonStream.SendNext)
+typedef void (*fn_send_t)(void *, void *, void *);
+static void h_SendNext(void *self, void *obj, void *mi) {
+    fn_send_t o = (fn_send_t)origOf(mi);
+    if (g_inSer && obj && g_snLog < 40 && il2cpp_object_get_class && il2cpp_class_get_name) {
+        void *k = il2cpp_object_get_class(obj);
+        const char *nm = k ? il2cpp_class_get_name(k) : NULL;
+        if (nm) {
+            float *f = (float *)((uintptr_t)obj + 0x10);
+            NSString *v = @"";
+            if (!strcmp(nm, "Quaternion")) v = [NSString stringWithFormat:@"%.2f %.2f %.2f %.2f", f[0], f[1], f[2], f[3]];
+            else if (!strcmp(nm, "Vector3")) v = [NSString stringWithFormat:@"%.2f %.2f %.2f", f[0], f[1], f[2]];
+            else if (!strcmp(nm, "Single")) v = [NSString stringWithFormat:@"%.2f", f[0]];
+            else if (!strcmp(nm, "Int32")) v = [NSString stringWithFormat:@"%d", *(int *)f];
+            else if (!strcmp(nm, "Boolean")) v = *(bool *)f ? @"true" : @"false";
+            g_snLog++;
+            [g_snText appendFormat:@"%d:%s %@  |  ", g_snLog, nm, v];
+        }
+    }
+    if (o) o(self, obj, mi);
 }
 
 // ---------------- ESP ----------------
@@ -299,12 +347,12 @@ static void h_Ser(void *self, void *stream, void *info, void *mi) {
     NSArray *all; @synchronized (g_players) { all = g_players.allObjects; }
     for (NSNumber *n in all) {
         void *p = (void *)n.unsignedLongValue; if (p == g_local || !alive(p)) continue;
-        Vec3 f = posOf(p), h = f; h.y += C.headH * scaleOf(p) * 1.15f;
+        Vec3 f = posOf(p), h = f; h.y += C.headH * scaleOf(p) * 1.3f;
         Vec3 sf, shd; Cam_w2s(cam, &f, 2, &sf); Cam_w2s(cam, &h, 2, &shd);
         if (sf.z <= 0 || shd.z <= 0) continue;
         CGFloat fx = sf.x / sw * S.width,  fy = (1 - sf.y / sh) * S.height;
         CGFloat hx = shd.x / sw * S.width, hy = (1 - shd.y / sh) * S.height;
-        CGFloat bh = fabs(fy - hy), bw = bh * 0.6, x = (fx + hx) / 2 - bw / 2, y = MIN(fy, hy);
+        CGFloat bh = fabs(fy - hy), bw = bh * 0.7, x = (fx + hx) / 2 - bw / 2, y = MIN(fy, hy);
         float hp = getHP(p); UIColor *col = hp > 50 ? UIColor.greenColor : (hp > 25 ? UIColor.yellowColor : UIColor.redColor);
         CGContextSetStrokeColorWithColor(c, col.CGColor); CGContextSetLineWidth(c, 1.5);
         CGContextStrokeRect(c, CGRectMake(x, y, bw, bh));
@@ -315,24 +363,116 @@ static void h_Ser(void *self, void *stream, void *info, void *mi) {
 }
 @end
 
-// ---------------- меню ----------------
-struct Item { const char *name; bool *p; };
-static Item items[] = {
-    {"Silent Aim 360", &C.silent}, {"Double Tap", &C.dtap}, {"No Spread", &C.nospread},
-    {"Bhop", &C.bhop}, {"Anti-Aim jitter", &C.aa}, {"ESP", &C.esp},
-    {"Black fog", &C.fog}, {"Black sky", &C.sky}, {"Hitmarker", &C.hitm},
-    {"Hitsound", &C.hitsnd}, {"Killsound", &C.killsnd},
-};
-@interface MenuH : NSObject
-- (void)tg:(UISwitch *)s; - (void)tap:(UIButton *)b;
+// ---------------- меню (стиль gamesense, чёрно-белое) ----------------
+#define GSC(v) [UIColor colorWithWhite:(v) / 255.0 alpha:1]
+static UIFont *gsF(CGFloat s) { UIFont *f = [UIFont fontWithName:@"Verdana" size:s]; return f ?: [UIFont systemFontOfSize:s]; }
+
+@interface GSCheck : UIView
+@property (nonatomic) bool *p; @property (nonatomic, copy) NSString *title;
 @end
-static UIView *g_panel;
+@implementation GSCheck
+- (void)drawRect:(CGRect)r {
+    bool on = _p && *_p; CGFloat cy = self.bounds.size.height / 2;
+    CGRect box = CGRectMake(0.5, cy - 4.5, 9, 9);
+    [GSC(on ? 232 : 20) setFill]; UIRectFill(box);
+    UIBezierPath *b = [UIBezierPath bezierPathWithRect:box]; b.lineWidth = 1; [GSC(on ? 255 : 62) setStroke]; [b stroke];
+    [_title drawAtPoint:CGPointMake(17, cy - 6.5) withAttributes:@{NSFontAttributeName: gsF(10), NSForegroundColorAttributeName: GSC(on ? 235 : 135)}];
+}
+- (void)touchesEnded:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e {
+    if (_p && CGRectContainsPoint(self.bounds, [t.anyObject locationInView:self])) { *_p = !*_p; [self setNeedsDisplay]; }
+}
+@end
+
+@interface GSSlider : UIView
+@property (nonatomic) float *p; @property (nonatomic) float mn, mx, step; @property (nonatomic, copy) NSString *title, *fmt;
+@end
+@implementation GSSlider
+- (void)drawRect:(CGRect)r {
+    CGFloat W = self.bounds.size.width; float v = _p ? *_p : 0;
+    [_title drawAtPoint:CGPointMake(0, 0) withAttributes:@{NSFontAttributeName: gsF(9), NSForegroundColorAttributeName: GSC(150)}];
+    NSString *vs = [NSString stringWithFormat:_fmt, (double)v];
+    NSDictionary *va = @{NSFontAttributeName: gsF(9), NSForegroundColorAttributeName: GSC(235)};
+    [vs drawAtPoint:CGPointMake(W - [vs sizeWithAttributes:va].width, 0) withAttributes:va];
+    CGRect bar = CGRectMake(0.5, 15.5, W - 1, 8);
+    [GSC(20) setFill]; UIRectFill(bar);
+    UIBezierPath *b = [UIBezierPath bezierPathWithRect:bar]; b.lineWidth = 1; [GSC(62) setStroke]; [b stroke];
+    CGFloat f = (_mx > _mn) ? (v - _mn) / (_mx - _mn) : 0; f = MAX(0.0, MIN(1.0, f));
+    CGFloat fw = (W - 3) * f;
+    [GSC(240) setFill]; UIRectFill(CGRectMake(1.5, 16.5, fw, 3));
+    [GSC(170) setFill]; UIRectFill(CGRectMake(1.5, 19.5, fw, 3));
+}
+- (void)applyTouch:(UITouch *)u {
+    CGFloat W = self.bounds.size.width; CGFloat f = ([u locationInView:self].x - 1.5) / (W - 3); f = MAX(0.0, MIN(1.0, f));
+    float v = _mn + (float)f * (_mx - _mn); if (_step > 0) v = roundf(v / _step) * _step;
+    if (_p) *_p = v; [self setNeedsDisplay];
+}
+- (void)touchesBegan:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e { [self applyTouch:t.anyObject]; }
+- (void)touchesMoved:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e { [self applyTouch:t.anyObject]; }
+@end
+
+@interface GSCombo : UIView
+@property (nonatomic) int *p; @property (nonatomic, strong) NSArray<NSString *> *opts; @property (nonatomic, copy) NSString *title;
+@end
+@implementation GSCombo
+- (void)drawRect:(CGRect)r {
+    CGFloat W = self.bounds.size.width;
+    [_title drawAtPoint:CGPointMake(0, 0) withAttributes:@{NSFontAttributeName: gsF(9), NSForegroundColorAttributeName: GSC(150)}];
+    CGRect box = CGRectMake(0.5, 13.5, W - 1, 17);
+    [GSC(20) setFill]; UIRectFill(box);
+    UIBezierPath *b = [UIBezierPath bezierPathWithRect:box]; b.lineWidth = 1; [GSC(62) setStroke]; [b stroke];
+    int i = _p ? *_p : 0; NSString *s = (i >= 0 && i < (int)_opts.count) ? _opts[i] : @"";
+    [s drawAtPoint:CGPointMake(6, 16.5) withAttributes:@{NSFontAttributeName: gsF(10), NSForegroundColorAttributeName: GSC(220)}];
+    UIBezierPath *a = [UIBezierPath bezierPath];
+    [a moveToPoint:CGPointMake(W - 14, 19.5)]; [a addLineToPoint:CGPointMake(W - 6, 19.5)]; [a addLineToPoint:CGPointMake(W - 10, 24.5)]; [a closePath];
+    [GSC(150) setFill]; [a fill];
+}
+- (void)touchesEnded:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e {
+    if (_p && _opts.count && CGRectContainsPoint(self.bounds, [t.anyObject locationInView:self])) { *_p = (*_p + 1) % (int)_opts.count; [self setNeedsDisplay]; }
+}
+@end
+
+@interface GSBtn : UIView
+@property (nonatomic, copy) NSString *title; @property (nonatomic, copy) void (^act)(void);
+@end
+@implementation GSBtn { BOOL _down; }
+- (void)drawRect:(CGRect)r {
+    CGRect box = CGRectInset(self.bounds, 0.5, 0.5);
+    [GSC(_down ? 45 : 20) setFill]; UIRectFill(box);
+    UIBezierPath *b = [UIBezierPath bezierPathWithRect:box]; b.lineWidth = 1; [GSC(70) setStroke]; [b stroke];
+    NSDictionary *a = @{NSFontAttributeName: gsF(10), NSForegroundColorAttributeName: GSC(235)};
+    CGSize sz = [_title sizeWithAttributes:a];
+    [_title drawAtPoint:CGPointMake((self.bounds.size.width - sz.width) / 2, (self.bounds.size.height - sz.height) / 2) withAttributes:a];
+}
+- (void)touchesBegan:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e { _down = YES; [self setNeedsDisplay]; }
+- (void)touchesCancelled:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e { _down = NO; [self setNeedsDisplay]; }
+- (void)touchesEnded:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e {
+    _down = NO; [self setNeedsDisplay];
+    if (_act && CGRectContainsPoint(self.bounds, [t.anyObject locationInView:self])) _act();
+}
+@end
+
+static UIView *g_panel; static ESPView *g_esp; static UILabel *g_snLabel;
+static NSMutableArray<UIView *> *g_pages; static NSMutableArray<UIButton *> *g_tabBtns;
+static void selectTab(int idx) {
+    for (int i = 0; i < (int)g_pages.count; i++) {
+        BOOL on = (i == idx); g_pages[i].hidden = !on;
+        UIButton *b = g_tabBtns[i]; b.backgroundColor = on ? GSC(24) : UIColor.clearColor;
+        [b setTitleColor:(on ? GSC(245) : GSC(125)) forState:UIControlStateNormal];
+        [b viewWithTag:99].hidden = !on;
+    }
+}
+@interface MenuH : NSObject
+- (void)tap:(UIButton *)b; - (void)tab:(UIButton *)b; - (void)pan:(UIPanGestureRecognizer *)g;
+@end
 @implementation MenuH
-- (void)tg:(UISwitch *)s { *items[s.tag].p = s.on; }
 - (void)tap:(UIButton *)b { g_panel.hidden = !g_panel.hidden; }
+- (void)tab:(UIButton *)b { selectTab((int)b.tag); }
+- (void)pan:(UIPanGestureRecognizer *)g {
+    UIView *sv = g_panel.superview; CGPoint t = [g translationInView:sv];
+    g_panel.center = CGPointMake(g_panel.center.x + t.x, g_panel.center.y + t.y); [g setTranslation:CGPointZero inView:sv];
+}
 @end
 static MenuH *g_h;
-static ESPView *g_esp;
 
 static UIWindow *keyWin() {
     for (UIScene *sc in UIApplication.sharedApplication.connectedScenes)
@@ -340,27 +480,120 @@ static UIWindow *keyWin() {
             for (UIWindow *w in ((UIWindowScene *)sc).windows) if (w.isKeyWindow) return w;
     return UIApplication.sharedApplication.windows.firstObject;
 }
+
+static UIView *gsGroup(UIView *parent, NSString *title, CGFloat y, CGFloat w) {
+    UIView *g = [[UIView alloc] initWithFrame:CGRectMake(0, y, w, 40)];
+    g.backgroundColor = GSC(13); g.layer.borderColor = GSC(46).CGColor; g.layer.borderWidth = 1;
+    UILabel *l = [UILabel new]; l.text = [NSString stringWithFormat:@" %@ ", title.lowercaseString];
+    l.font = gsF(9); l.textColor = GSC(235); l.backgroundColor = GSC(10); [l sizeToFit];
+    l.frame = CGRectMake(8, -7, l.frame.size.width, 13);
+    [g addSubview:l]; [parent addSubview:g]; return g;
+}
+static CGFloat gsCheck(UIView *g, CGFloat y, const char *nm, bool *p) {
+    GSCheck *c = [[GSCheck alloc] initWithFrame:CGRectMake(10, y, g.bounds.size.width - 20, 20)];
+    c.backgroundColor = UIColor.clearColor; c.p = p; c.title = [NSString stringWithUTF8String:nm]; [g addSubview:c]; return y + 21;
+}
+static CGFloat gsSlider(UIView *g, CGFloat y, const char *nm, float *p, float mn, float mx, float step, NSString *fmt) {
+    GSSlider *s = [[GSSlider alloc] initWithFrame:CGRectMake(10, y, g.bounds.size.width - 20, 28)];
+    s.backgroundColor = UIColor.clearColor; s.p = p; s.mn = mn; s.mx = mx; s.step = step; s.fmt = fmt;
+    s.title = [NSString stringWithUTF8String:nm]; [g addSubview:s]; return y + 31;
+}
+static CGFloat gsCombo(UIView *g, CGFloat y, const char *nm, int *p, NSArray<NSString *> *opts) {
+    GSCombo *c = [[GSCombo alloc] initWithFrame:CGRectMake(10, y, g.bounds.size.width - 20, 32)];
+    c.backgroundColor = UIColor.clearColor; c.p = p; c.opts = opts; c.title = [NSString stringWithUTF8String:nm]; [g addSubview:c]; return y + 36;
+}
+static CGFloat gsFit(UIView *g, CGFloat y) {
+    CGRect f = g.frame; f.size.height = y + 6; g.frame = f; return CGRectGetMaxY(f) + 12;
+}
+
 static void buildUI() {
     UIWindow *w = keyWin(); if (!w) return; g_h = [MenuH new];
     g_esp = [[ESPView alloc] initWithFrame:w.bounds]; g_esp.userInteractionEnabled = NO;
     g_esp.backgroundColor = UIColor.clearColor; g_esp.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     [w addSubview:g_esp];
     CADisplayLink *dl = [CADisplayLink displayLinkWithTarget:g_esp selector:@selector(setNeedsDisplay)]; [dl addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
-    int n = sizeof(items) / sizeof(items[0]);
-    g_panel = [[UIView alloc] initWithFrame:CGRectMake(10, 60, 210, 12 + n * 34)];
-    g_panel.backgroundColor = [UIColor colorWithWhite:0 alpha:0.75]; g_panel.layer.cornerRadius = 10; g_panel.hidden = YES;
-    for (int i = 0; i < n; i++) {
-        UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(10, 8 + i * 34, 120, 30)];
-        l.text = [NSString stringWithUTF8String:items[i].name]; l.textColor = UIColor.whiteColor; l.font = [UIFont systemFontOfSize:13];
-        UISwitch *s = [[UISwitch alloc] initWithFrame:CGRectMake(145, 8 + i * 34, 51, 31)];
-        s.transform = CGAffineTransformMakeScale(0.75, 0.75); s.on = *items[i].p; s.tag = i;
-        [s addTarget:g_h action:@selector(tg:) forControlEvents:UIControlEventValueChanged];
-        [g_panel addSubview:l]; [g_panel addSubview:s];
+
+    const CGFloat PW = 430, PH = 282, TAB = 74, HDR = 22, CW = PW - TAB - 14;
+    g_panel = [[UIView alloc] initWithFrame:CGRectMake(56, 8, PW, PH)];
+    g_panel.backgroundColor = GSC(10); g_panel.layer.borderColor = GSC(48).CGColor; g_panel.layer.borderWidth = 1; g_panel.hidden = YES;
+    UIView *inner = [[UIView alloc] initWithFrame:CGRectInset(g_panel.bounds, 3, 3)];
+    inner.userInteractionEnabled = NO; inner.layer.borderColor = GSC(26).CGColor; inner.layer.borderWidth = 1; [g_panel addSubview:inner];
+    CAGradientLayer *gl = [CAGradientLayer layer]; gl.frame = CGRectMake(1, 1, PW - 2, 2);
+    gl.startPoint = CGPointMake(0, 0.5); gl.endPoint = CGPointMake(1, 0.5);
+    gl.colors = @[(id)GSC(45).CGColor, (id)GSC(245).CGColor, (id)GSC(45).CGColor]; [g_panel.layer addSublayer:gl];
+    UIView *hdr = [[UIView alloc] initWithFrame:CGRectMake(0, 0, PW, HDR)];
+    UILabel *ht = [[UILabel alloc] initWithFrame:CGRectMake(12, 7, 200, 12)]; ht.text = @"chickenmenu"; ht.font = gsF(9); ht.textColor = GSC(150);
+    [hdr addSubview:ht];
+    [hdr addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:g_h action:@selector(pan:)]];
+    [g_panel addSubview:hdr];
+
+    UIView *tabBg = [[UIView alloc] initWithFrame:CGRectMake(6, HDR + 2, TAB - 6, PH - HDR - 8)];
+    tabBg.backgroundColor = GSC(13); tabBg.layer.borderColor = GSC(46).CGColor; tabBg.layer.borderWidth = 1; [g_panel addSubview:tabBg];
+    NSArray *names = @[@"RAGE", @"ANTI-AIM", @"VISUALS", @"MISC", @"DEBUG"];
+    g_pages = [NSMutableArray new]; g_tabBtns = [NSMutableArray new];
+    for (int i = 0; i < (int)names.count; i++) {
+        UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom]; b.frame = CGRectMake(7, HDR + 10 + i * 28, TAB - 8, 26); b.tag = i;
+        [b setTitle:names[i] forState:UIControlStateNormal]; b.titleLabel.font = gsF(9);
+        [b addTarget:g_h action:@selector(tab:) forControlEvents:UIControlEventTouchUpInside];
+        UIView *bar = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 2, 26)]; bar.backgroundColor = GSC(245); bar.tag = 99; bar.userInteractionEnabled = NO; [b addSubview:bar];
+        [g_panel addSubview:b]; [g_tabBtns addObject:b];
+        UIView *pg = [[UIView alloc] initWithFrame:CGRectMake(TAB + 6, HDR + 8, CW, PH - HDR - 16)]; [g_panel addSubview:pg]; [g_pages addObject:pg];
     }
-    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem]; b.frame = CGRectMake(10, 15, 40, 40);
-    [b setTitle:@"M" forState:UIControlStateNormal]; b.backgroundColor = [UIColor colorWithWhite:0 alpha:0.6];
-    b.layer.cornerRadius = 20; [b addTarget:g_h action:@selector(tap:) forControlEvents:UIControlEventTouchUpInside];
-    [w addSubview:g_panel]; [w addSubview:b];
+
+    { // RAGE
+        UIView *pg = g_pages[0]; UIView *g = gsGroup(pg, @"aimbot", 8, CW); CGFloat y = 14;
+        y = gsCheck(g, y, "Silent Aim 360", &C.silent);
+        y = gsCheck(g, y, "Double Tap", &C.dtap);
+        y = gsCheck(g, y, "No Spread", &C.nospread);
+        gsFit(g, y);
+    }
+    { // ANTI-AIM
+        UIView *pg = g_pages[1]; UIView *g = gsGroup(pg, @"anti-aim", 8, CW); CGFloat y = 14;
+        y = gsCheck(g, y, "Enabled", &C.aa);
+        y = gsCombo(g, y, "Mode", &C.aaMode, @[@"Jitter", @"Spin", @"Static", @"Random"]);
+        y = gsSlider(g, y, "Yaw offset", &C.aaBase, 0, 360, 5, @"%.0f°");
+        y = gsSlider(g, y, "Jitter / random range", &C.aaOff, 0, 180, 5, @"%.0f°");
+        y = gsSlider(g, y, "Spin speed", &C.aaSpin, 1, 90, 1, @"%.0f°/tick");
+        gsFit(g, y);
+    }
+    { // VISUALS
+        UIView *pg = g_pages[2]; UIView *g = gsGroup(pg, @"esp", 8, CW); CGFloat y = 14;
+        y = gsCheck(g, y, "ESP boxes / nick / hp", &C.esp);
+        y = gsCheck(g, y, "Hitmarker", &C.hitm);
+        CGFloat ny = gsFit(g, y);
+        g = gsGroup(pg, @"world", ny, CW); y = 14;
+        y = gsCheck(g, y, "Black fog", &C.fog);
+        y = gsCheck(g, y, "Black sky", &C.sky);
+        gsFit(g, y);
+    }
+    { // MISC
+        UIView *pg = g_pages[3]; UIView *g = gsGroup(pg, @"movement", 8, CW); CGFloat y = 14;
+        y = gsCheck(g, y, "Bhop", &C.bhop);
+        y = gsSlider(g, y, "Speed multiplier", &C.bhopMul, 1.0f, 3.0f, 0.05f, @"%.2fx");
+        CGFloat ny = gsFit(g, y);
+        g = gsGroup(pg, @"sounds", ny, CW); y = 14;
+        y = gsCheck(g, y, "Hitsound", &C.hitsnd);
+        y = gsCheck(g, y, "Killsound", &C.killsnd);
+        gsFit(g, y);
+    }
+    { // DEBUG
+        UIView *pg = g_pages[4]; UIView *g = gsGroup(pg, @"photon stream", 8, CW);
+        GSBtn *cap = [[GSBtn alloc] initWithFrame:CGRectMake(10, 14, 190, 22)]; cap.backgroundColor = UIColor.clearColor;
+        cap.title = @"capture next sync"; cap.act = ^{ g_cap = true; [g_snText setString:@""]; };
+        [g addSubview:cap];
+        g_snLabel = [[UILabel alloc] initWithFrame:CGRectMake(10, 44, CW - 20, 150)];
+        g_snLabel.font = [UIFont fontWithName:@"Menlo" size:8]; g_snLabel.textColor = GSC(190); g_snLabel.numberOfLines = 0;
+        g_snLabel.lineBreakMode = NSLineBreakByWordWrapping; g_snLabel.text = @"press capture and wait 1-2 sec";
+        [g addSubview:g_snLabel];
+        gsFit(g, 44 + 150);
+    }
+
+    UIButton *tb = [UIButton buttonWithType:UIButtonTypeCustom]; tb.frame = CGRectMake(10, 15, 34, 34);
+    tb.backgroundColor = GSC(10); tb.layer.borderColor = GSC(70).CGColor; tb.layer.borderWidth = 1;
+    [tb setTitle:@"V" forState:UIControlStateNormal]; tb.titleLabel.font = gsF(13);
+    [tb addTarget:g_h action:@selector(tap:) forControlEvents:UIControlEventTouchUpInside];
+    [w addSubview:g_panel]; [w addSubview:tb];
+    selectTab(0);
 }
 
 
@@ -430,6 +663,16 @@ static void *findImage(const char *sub) {
     return NULL;
 }
 
+static void *findClassAny(const char *cls) {
+    size_t n = 0; void **as = il_domain_get_assemblies(il_domain_get(), &n);
+    const char *nss[] = {"Photon.Pun", "", "Photon.Realtime"};
+    for (size_t i = 0; i < n; i++) {
+        void *img = il_assembly_get_image(as[i]); if (!img) continue;
+        for (const char *ns : nss) { void *k = il_class_from_name(img, ns, cls); if (k) return k; }
+    }
+    return NULL;
+}
+
 static void installPatches() {
     void *img = findImage("Assembly-CSharp");
     if (!img) { fail("image", @"Assembly-CSharp not found"); report(); return; }
@@ -443,6 +686,7 @@ static void installPatches() {
     patchMI("CM.Update",  il_class_get_method(cm, "Update", 0),    RVA_CM_Update,    (void *)h_Update);     report();
     patchVT("DR.Damage",  dr, il_class_get_method(dr, "Damage", 2), RVA_DR_Damage,   (void *)h_Damage);     report();
     patchVT("CM.Serialize", cm, il_class_get_method(cm, "OnPhotonSerializeView", 2), RVA_CM_Serialize, (void *)h_Ser); report();
+    { void *ps = findClassAny("PhotonStream"); patchMI("PS.SendNext", ps ? il_class_get_method(ps, "SendNext", 1) : NULL, RVA_PS_SendNext, (void *)h_SendNext); report(); }
 
     patchMI("BUL.Update", il_class_get_method(bb, "Update", 0), 0x3DC0188, (void *)h_BulUpdate);
     uint32_t cnt = il_image_get_class_count(img); int sub = 0;
@@ -514,12 +758,13 @@ static void setup() {
     SYM(il_image_get_class_count, "il2cpp_image_get_class_count"); SYM(il_image_get_class, "il2cpp_image_get_class");
     SYM(il_class_from_name, "il2cpp_class_from_name"); SYM(il_class_get_method, "il2cpp_class_get_method_from_name");
     SYM(il_class_get_parent, "il2cpp_class_get_parent");
+    SYM(il2cpp_object_get_class, "il2cpp_object_get_class"); SYM(il2cpp_class_get_name, "il2cpp_class_get_name");
     if (!B || !resolve_icall || !il_domain_get) {
         NSLog(@"[CM] base/il2cpp api not found, retry");
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{ setup(); });
         return;
     }
-    g_players = [NSMutableSet new]; g_fails = [NSMutableString new];
+    g_players = [NSMutableSet new]; g_fails = [NSMutableString new]; g_snText = [NSMutableString new]; initSounds();
     coreImg = findImage("UnityEngine.CoreModule");
     SYM(il_array_new, "il2cpp_array_new");
     camKlass = coreImg ? il_class_from_name(coreImg, "UnityEngine", "Camera") : NULL;
@@ -561,15 +806,16 @@ static void setup() {
     }
     buildUI();
     UIWindow *w = keyWin();
-    g_status = [[UILabel alloc] initWithFrame:CGRectMake(60, 22, 330, 30)];
+    g_status = [[UILabel alloc] initWithFrame:CGRectMake(60, w.bounds.size.height - 48, 330, 16)];
     g_status.textColor = UIColor.yellowColor; g_status.font = [UIFont boldSystemFontOfSize:11]; g_status.userInteractionEnabled = NO;
     [w addSubview:g_status];
     if (prev.length) showStatus([NSString stringWithFormat:@"prev: %@ | bc: %@ | skip: %@", prev, prevBc, [g_skip.allObjects componentsJoinedByString:@","]]);
-    UILabel *dbg = [[UILabel alloc] initWithFrame:CGRectMake(60, 44, 420, 30)];
+    UILabel *dbg = [[UILabel alloc] initWithFrame:CGRectMake(60, w.bounds.size.height - 32, 420, 30)];
     dbg.textColor = UIColor.cyanColor; dbg.font = [UIFont boldSystemFontOfSize:10]; dbg.numberOfLines = 3; dbg.userInteractionEnabled = NO;
     dbg.text = api; [w addSubview:dbg];
     [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *t) {
         NSUInteger np; @synchronized (g_players) { np = g_players.count; }
+        if (g_snLabel) g_snLabel.text = g_snText.length ? g_snText : @"press capture and wait 1-2 sec";
         dbg.text = [NSString stringWithFormat:@"%@\ncam=%d local=%d players=%lu target=%d", api, pickCamera() != NULL, g_local != NULL, (unsigned long)np, g_hasTarget];
     }];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 4 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{ installPatches(); });
