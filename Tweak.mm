@@ -7,6 +7,8 @@
 #include <string.h>
 #include <stdint.h>
 #include <stddef.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 struct Vec3 { float x, y, z; };
 struct Quat { float x, y, z, w; };
@@ -128,6 +130,15 @@ static void updateTarget() {
     }
 }
 
+// ---------------- хлебные крошки (место падения) ----------------
+static int g_bcFd = -1;
+static void bc(const char *s) {
+    if (g_bcFd < 0) return;
+    char b[40]; memset(b, ' ', sizeof b); size_t n = strlen(s); if (n > 38) n = 38;
+    memcpy(b, s, n); b[39] = '\n'; pwrite(g_bcFd, b, sizeof b, 0);
+}
+static void *pickCamera();
+
 // ---------------- таблица оригинальных указателей ----------------
 struct OrigE { void *mi; void *fn; };
 static OrigE g_orig[128]; static int g_nOrig;
@@ -158,9 +169,9 @@ static void h_Destroy(void *self, void *mi) {
 
 static void applyVisuals() {
     if (C.fog && RS_fog && RS_fogCol && RS_fogMode && RS_fogDens) { Col k = {0, 0, 0, 1}; RS_fog(true); RS_fogCol(&k); RS_fogMode(2); RS_fogDens(0.1f); }
-    if (C.sky && Cam_main && Cam_clear && Cam_bg) {
+    if (C.sky && Cam_clear && Cam_bg) {
         if (RS_skybox) RS_skybox(NULL);
-        void *cam = Cam_main(); Col k = {0, 0, 0, 1};
+        void *cam = pickCamera(); Col k = {0, 0, 0, 1};
         if (cam) { Cam_clear(cam, 2); Cam_bg(cam, &k); }
     }
 }
@@ -170,7 +181,7 @@ static void h_Update(void *self, void *mi) {
     fn_v_t o = (fn_v_t)origOf(mi); if (o) o(self, mi);
     if (!g_local && isMine(self)) g_local = self;
     if (self != g_local) return;
-    updateTarget(); applyVisuals();
+    bc("tgt"); updateTarget(); bc("vis"); applyVisuals(); bc("idle");
 
     void *pwm = *(void **)((uintptr_t)self + OFF_CM_PWM);
     void *w = pwm ? *(void **)((uintptr_t)pwm + OFF_PWM_Weapon) : NULL;
@@ -210,23 +221,27 @@ static void h_Update(void *self, void *mi) {
 // silent aim на самой пуле (Update у BaseBulletScript и подклассов)
 static int g_bulLog;
 static void h_BulUpdate(void *self, void *mi) {
-    if (g_local && C.silent && g_hasTarget) {
-        bool orig = *(bool *)((uintptr_t)self + OFF_BUL_Orig);
+    if (g_local && C.silent && g_hasTarget && *(bool *)((uintptr_t)self + OFF_BUL_Orig)) {
         int owner = *(int *)((uintptr_t)self + OFF_BUL_Owner);
         float life = *(float *)((uintptr_t)self + OFF_BUL_Life);
-        if (orig && life < 0.05f && owner == viewID(g_local)) {
+        if (life < 0.05f && owner == viewID(g_local)) {
+            bc("bul:enter");
             Vec3 *dir = (Vec3 *)((uintptr_t)self + OFF_BUL_Dir);
-            if (g_bulLog < 10) { g_bulLog++; NSLog(@"[BUL] owner=%d dir=%f %f %f", owner, dir->x, dir->y, dir->z); }
+            if (g_bulLog < 10) { g_bulLog++; NSLog(@"[BUL] owner=%d dir=%f %f %f aim=%f %f %f", owner, dir->x, dir->y, dir->z, g_aim.x, g_aim.y, g_aim.z); }
             void *tr = *(void **)((uintptr_t)self + OFF_BUL_Tr);
             if (tr && Tr_get_pos) {
-                Vec3 p; Tr_get_pos(tr, &p);
+                bc("bul:pos"); Vec3 p; Tr_get_pos(tr, &p);
                 Vec3 d = {g_aim.x - p.x, g_aim.y - p.y, g_aim.z - p.z};
                 float l = sqrtf(d.x*d.x + d.y*d.y + d.z*d.z);
-                if (l > 0.001f) {
+                if (l > 0.001f && isfinite(l)) {
                     d.x /= l; d.y /= l; d.z /= l; *dir = d;
-                    if (Quat_Look && Tr_set_rot) { Vec3 up = {0, 1, 0}; Quat q; Quat_Look(&d, &up, &q); Tr_set_rot(tr, &q); }
+                    if (Quat_Look && Tr_set_rot) {
+                        bc("bul:look"); Vec3 up = {0, 1, 0}; Quat q; Quat_Look(&d, &up, &q);
+                        bc("bul:setrot"); Tr_set_rot(tr, &q);
+                    }
                 }
             }
+            bc("idle");
         }
     }
     fn_v_t o = (fn_v_t)origOf(mi); if (o) o(self, mi);
@@ -235,12 +250,15 @@ static void h_BulUpdate(void *self, void *mi) {
 // хитмаркер / хитсаунд (DamageReciver2.Damage, vtable)
 static int g_dmgLog;
 static void h_Damage(void *self, float dmg, int from, void *mi) {
+    bc("dmg:orig");
     fn_dmg_t o = (fn_dmg_t)origOf(mi); if (o) o(self, dmg, from, mi);
+    bc("dmg:post");
     if (g_dmgLog < 15) { g_dmgLog++; NSLog(@"[HIT] dmg=%f from=%d local=%d", dmg, from, g_local ? viewID(g_local) : -1); }
     if (g_local && from == viewID(g_local)) {
         g_hitTime = CACurrentMediaTime();
         if (C.hitsnd) AudioServicesPlaySystemSound(1057);
     }
+    bc("idle");
 }
 
 // anti-aim: на время сериализации поворачиваем трансформ, потом возвращаем
@@ -249,6 +267,7 @@ static void h_Ser(void *self, void *stream, void *info, void *mi) {
     fn_ser_t o = (fn_ser_t)origOf(mi);
     void *tr = NULL; Quat saved = {0, 0, 0, 1};
     if (C.aa && self == g_local && stream && *(bool *)((uintptr_t)stream + OFF_PS_Writing) && Comp_get_tr && Tr_get_rot && Tr_set_rot) {
+        bc("ser:aa");
         tr = Comp_get_tr(self);
         if (tr) {
             Tr_get_rot(tr, &saved); g_aaTick++;
@@ -258,7 +277,7 @@ static void h_Ser(void *self, void *stream, void *info, void *mi) {
         }
     }
     if (o) o(self, stream, info, mi);
-    if (tr) Tr_set_rot(tr, &saved);
+    if (tr) { Tr_set_rot(tr, &saved); bc("idle"); }
 }
 
 // ---------------- ESP ----------------
@@ -274,9 +293,9 @@ static void h_Ser(void *self, void *stream, void *info, void *mi) {
         }
         CGContextStrokePath(c);
     }
-    if (!C.esp || !g_local || !Cam_main || !Cam_w2s) return;
-    void *cam = Cam_main(); if (!cam) return;
-    float sw = Scr_w(), sh = Scr_h(); if (sw < 1 || sh < 1) return;
+    if (!C.esp || !g_local || !Cam_w2s || !Scr_w || !Scr_h) return;
+    bc("esp"); void *cam = pickCamera(); if (!cam) { bc("idle"); return; }
+    float sw = Scr_w(), sh = Scr_h(); if (sw < 1 || sh < 1) { bc("idle"); return; }
     NSArray *all; @synchronized (g_players) { all = g_players.allObjects; }
     for (NSNumber *n in all) {
         void *p = (void *)n.unsignedLongValue; if (p == g_local || !alive(p)) continue;
@@ -292,6 +311,7 @@ static void h_Ser(void *self, void *stream, void *info, void *mi) {
         NSString *t = [NSString stringWithFormat:@"%@  %d", nickOf(p), (int)hp];
         [t drawAtPoint:CGPointMake(x, y - 13) withAttributes:@{NSFontAttributeName: [UIFont boldSystemFontOfSize:10], NSForegroundColorAttributeName: UIColor.whiteColor}];
     }
+    bc("idle");
 }
 @end
 
@@ -401,17 +421,17 @@ static void *(*il_class_from_name)(void *, const char *, const char *);
 static void *(*il_class_get_method)(void *, const char *, int);
 static void *(*il_class_get_parent)(void *);
 
-static void *findImage() {
+static void *findImage(const char *sub) {
     size_t n = 0; void **as = il_domain_get_assemblies(il_domain_get(), &n);
     for (size_t i = 0; i < n; i++) {
         void *img = il_assembly_get_image(as[i]); const char *nm = img ? il_image_get_name(img) : NULL;
-        if (nm && strstr(nm, "Assembly-CSharp")) return img;
+        if (nm && strstr(nm, sub)) return img;
     }
     return NULL;
 }
 
 static void installPatches() {
-    void *img = findImage();
+    void *img = findImage("Assembly-CSharp");
     if (!img) { fail("image", @"Assembly-CSharp not found"); report(); return; }
     void *cm = il_class_from_name(img, "", "CharacterMotor");
     void *dr = il_class_from_name(img, "", "DamageReciver2");
@@ -436,6 +456,53 @@ static void installPatches() {
     report();
 }
 
+// ---------------- managed-обёртки (методы Unity берём из метаданных игры) ----------------
+static void *coreImg, *camKlass;
+static void *(*il_array_new)(void *, uintptr_t);
+struct MM { void *fn, *mi; };
+static MM m_gtr, m_gpos, m_grot, m_srot, m_look, m_w2s, m_main, m_sw, m_sh, m_fog, m_fogMode, m_fogDens, m_fogCol, m_sky, m_clear, m_bg, m_allCnt, m_getAll, m_enabled, m_targetTex;
+static bool mgd(const char *ns, const char *cls, const char *meth, int argc, MM *out) {
+    if (!coreImg) return false;
+    void *k = il_class_from_name(coreImg, ns, cls); if (!k) return false;
+    void *x = il_class_get_method(k, meth, argc); if (!x) return false;
+    out->mi = x; out->fn = *(void **)x; return out->fn != NULL;
+}
+static void *w_gtr(void *c) { return ((void *(*)(void *, void *))m_gtr.fn)(c, m_gtr.mi); }
+static void w_gpos(void *t, Vec3 *o) { *o = ((Vec3 (*)(void *, void *))m_gpos.fn)(t, m_gpos.mi); }
+static void w_grot(void *t, Quat *o) { *o = ((Quat (*)(void *, void *))m_grot.fn)(t, m_grot.mi); }
+static void w_srot(void *t, Quat *q) { ((void (*)(void *, Quat, void *))m_srot.fn)(t, *q, m_srot.mi); }
+static void w_look(Vec3 *f, Vec3 *u, Quat *o) { *o = ((Quat (*)(Vec3, Vec3, void *))m_look.fn)(*f, *u, m_look.mi); }
+static void w_w2s(void *cam, Vec3 *p, int eye, Vec3 *o) { *o = ((Vec3 (*)(void *, Vec3, void *))m_w2s.fn)(cam, *p, m_w2s.mi); }
+static void *w_main(void) { return ((void *(*)(void *))m_main.fn)(m_main.mi); }
+static int w_sw(void) { return ((int (*)(void *))m_sw.fn)(m_sw.mi); }
+static int w_sh(void) { return ((int (*)(void *))m_sh.fn)(m_sh.mi); }
+static void w_fog(bool b) { ((void (*)(bool, void *))m_fog.fn)(b, m_fog.mi); }
+static void w_fogMode(int m) { ((void (*)(int, void *))m_fogMode.fn)(m, m_fogMode.mi); }
+static void w_fogDens(float d) { ((void (*)(float, void *))m_fogDens.fn)(d, m_fogDens.mi); }
+static void w_fogCol(Col *c) { ((void (*)(Col, void *))m_fogCol.fn)(*c, m_fogCol.mi); }
+static void w_sky(void *m) { ((void (*)(void *, void *))m_sky.fn)(m, m_sky.mi); }
+static void w_clear(void *cam, int f) { ((void (*)(void *, int, void *))m_clear.fn)(cam, f, m_clear.mi); }
+static void w_bg(void *cam, Col *c) { ((void (*)(void *, Col, void *))m_bg.fn)(cam, *c, m_bg.mi); }
+
+static void *pickCamera() {
+    static void *cached; static double cachedT;
+    void *c = Cam_main ? Cam_main() : NULL; if (c) return c;
+    double now = CACurrentMediaTime();
+    if (cached && now - cachedT < 0.5) return cached;
+    cachedT = now; cached = NULL;
+    if (!m_allCnt.fn || !m_getAll.fn || !il_array_new || !camKlass) return NULL;
+    int n = ((int (*)(void *))m_allCnt.fn)(m_allCnt.mi); if (n <= 0 || n > 16) return NULL;
+    void *arr = il_array_new(camKlass, n); if (!arr) return NULL;
+    ((int (*)(void *, void *))m_getAll.fn)(arr, m_getAll.mi);
+    for (int i = 0; i < n; i++) {
+        void *cam = ((void **)((uintptr_t)arr + 0x20))[i]; if (!cam) continue;
+        bool en = m_enabled.fn ? ((bool (*)(void *, void *))m_enabled.fn)(cam, m_enabled.mi) : true;
+        void *tt = m_targetTex.fn ? ((void *(*)(void *, void *))m_targetTex.fn)(cam, m_targetTex.mi) : NULL;
+        if (en && !tt) { cached = cam; break; }
+    }
+    return cached;
+}
+
 // ---------------- инициализация ----------------
 static void setup() {
     B = getBase("UnityFramework");
@@ -453,24 +520,37 @@ static void setup() {
         return;
     }
     g_players = [NSMutableSet new]; g_fails = [NSMutableString new];
-    ICALL(Cam_main,   "UnityEngine.Camera::get_main()");
-    ICALL(Comp_get_tr,"UnityEngine.Component::get_transform()");
-    ICALL(Tr_get_pos, "UnityEngine.Transform::get_position_Injected(UnityEngine.Vector3&)");
-    ICALL(Tr_get_rot, "UnityEngine.Transform::get_rotation_Injected(UnityEngine.Quaternion&)");
-    ICALL(Tr_set_rot, "UnityEngine.Transform::set_rotation_Injected(UnityEngine.Quaternion&)");
-    ICALL(Quat_Look,  "UnityEngine.Quaternion::LookRotation_Injected(UnityEngine.Vector3&,UnityEngine.Vector3&,UnityEngine.Quaternion&)");
-    ICALL(Cam_w2s,    "UnityEngine.Camera::WorldToScreenPoint_Injected(UnityEngine.Vector3&,UnityEngine.Camera/MonoOrStereoscopicEye,UnityEngine.Vector3&)");
-    ICALL(Scr_w,      "UnityEngine.Screen::get_width()");
-    ICALL(Scr_h,      "UnityEngine.Screen::get_height()");
-    ICALL(RS_fog,     "UnityEngine.RenderSettings::set_fog(System.Boolean)");
-    ICALL(RS_fogMode, "UnityEngine.RenderSettings::set_fogMode(UnityEngine.FogMode)");
-    ICALL(RS_fogDens, "UnityEngine.RenderSettings::set_fogDensity(System.Single)");
-    ICALL(RS_fogCol,  "UnityEngine.RenderSettings::set_fogColor_Injected(UnityEngine.Color&)");
-    ICALL(RS_skybox,  "UnityEngine.RenderSettings::set_skybox(UnityEngine.Material)");
-    ICALL(Cam_clear,  "UnityEngine.Camera::set_clearFlags(UnityEngine.CameraClearFlags)");
-    ICALL(Cam_bg,     "UnityEngine.Camera::set_backgroundColor_Injected(UnityEngine.Color&)");
-    NSLog(@"[CM] icall main=%p tr=%p pos=%p rot=%p w2s=%p fog=%p sky=%p clear=%p look=%p", Cam_main, Comp_get_tr, Tr_get_pos, Tr_get_rot, Cam_w2s, RS_fog, RS_skybox, Cam_clear, Quat_Look);
+    coreImg = findImage("UnityEngine.CoreModule");
+    SYM(il_array_new, "il2cpp_array_new");
+    camKlass = coreImg ? il_class_from_name(coreImg, "UnityEngine", "Camera") : NULL;
+    NSMutableString *api = [NSMutableString stringWithFormat:@"core:%d ", coreImg != NULL];
+#define API(var, wrapper, mm, ns, cls, meth, argc, icname, tag) \
+    do { if (mgd(ns, cls, meth, argc, &mm)) { var = (decltype(var))wrapper; [api appendString:@tag ":M "]; } \
+         else { ICALL(var, icname); [api appendString:var ? @tag ":i " : @tag ":X "]; } } while (0)
+    API(Cam_main,    w_main,   m_main,    "UnityEngine", "Camera",         "get_main", 0, "UnityEngine.Camera::get_main()", "main");
+    API(Comp_get_tr, w_gtr,    m_gtr,     "UnityEngine", "Component",      "get_transform", 0, "UnityEngine.Component::get_transform()", "tr");
+    API(Tr_get_pos,  w_gpos,   m_gpos,    "UnityEngine", "Transform",      "get_position", 0, "UnityEngine.Transform::get_position_Injected(UnityEngine.Vector3&)", "pos");
+    API(Tr_get_rot,  w_grot,   m_grot,    "UnityEngine", "Transform",      "get_rotation", 0, "UnityEngine.Transform::get_rotation_Injected(UnityEngine.Quaternion&)", "rot");
+    API(Tr_set_rot,  w_srot,   m_srot,    "UnityEngine", "Transform",      "set_rotation", 1, "UnityEngine.Transform::set_rotation_Injected(UnityEngine.Quaternion&)", "srot");
+    API(Quat_Look,   w_look,   m_look,    "UnityEngine", "Quaternion",     "LookRotation", 2, "UnityEngine.Quaternion::LookRotation_Injected(UnityEngine.Vector3&,UnityEngine.Vector3&,UnityEngine.Quaternion&)", "look");
+    API(Cam_w2s,     w_w2s,    m_w2s,     "UnityEngine", "Camera",         "WorldToScreenPoint", 1, "UnityEngine.Camera::WorldToScreenPoint_Injected(UnityEngine.Vector3&,UnityEngine.Camera/MonoOrStereoscopicEye,UnityEngine.Vector3&)", "w2s");
+    API(Scr_w,       w_sw,     m_sw,      "UnityEngine", "Screen",         "get_width", 0, "UnityEngine.Screen::get_width()", "sw");
+    API(Scr_h,       w_sh,     m_sh,      "UnityEngine", "Screen",         "get_height", 0, "UnityEngine.Screen::get_height()", "sh");
+    API(RS_fog,      w_fog,    m_fog,     "UnityEngine", "RenderSettings", "set_fog", 1, "UnityEngine.RenderSettings::set_fog(System.Boolean)", "fog");
+    API(RS_fogMode,  w_fogMode,m_fogMode, "UnityEngine", "RenderSettings", "set_fogMode", 1, "UnityEngine.RenderSettings::set_fogMode(UnityEngine.FogMode)", "fmode");
+    API(RS_fogDens,  w_fogDens,m_fogDens, "UnityEngine", "RenderSettings", "set_fogDensity", 1, "UnityEngine.RenderSettings::set_fogDensity(System.Single)", "fdens");
+    API(RS_fogCol,   w_fogCol, m_fogCol,  "UnityEngine", "RenderSettings", "set_fogColor", 1, "UnityEngine.RenderSettings::set_fogColor_Injected(UnityEngine.Color&)", "fcol");
+    API(RS_skybox,   w_sky,    m_sky,     "UnityEngine", "RenderSettings", "set_skybox", 1, "UnityEngine.RenderSettings::set_skybox(UnityEngine.Material)", "sky");
+    API(Cam_clear,   w_clear,  m_clear,   "UnityEngine", "Camera",         "set_clearFlags", 1, "UnityEngine.Camera::set_clearFlags(UnityEngine.CameraClearFlags)", "clr");
+    API(Cam_bg,      w_bg,     m_bg,      "UnityEngine", "Camera",         "set_backgroundColor", 1, "UnityEngine.Camera::set_backgroundColor_Injected(UnityEngine.Color&)", "bg");
+    mgd("UnityEngine", "Camera", "get_allCamerasCount", 0, &m_allCnt);
+    mgd("UnityEngine", "Camera", "GetAllCameras", 1, &m_getAll);
+    mgd("UnityEngine", "Behaviour", "get_enabled", 0, &m_enabled);
+    mgd("UnityEngine", "Camera", "get_targetTexture", 0, &m_targetTex);
+    NSLog(@"[CM] api %@", api);
 
+    NSString *prevBc = [[NSString stringWithContentsOfFile:docPath(@"cm_bc.txt") encoding:NSUTF8StringEncoding error:nil] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    g_bcFd = open([docPath(@"cm_bc.txt") fileSystemRepresentation], O_RDWR | O_CREAT, 0644);
     NSString *prev = [NSString stringWithContentsOfFile:docPath(@"cm_state.txt") encoding:NSUTF8StringEncoding error:nil];
     g_skip = [NSMutableSet set];
     for (NSString *l in [[NSString stringWithContentsOfFile:docPath(@"cm_skip.txt") encoding:NSUTF8StringEncoding error:nil] componentsSeparatedByString:@"\n"])
@@ -484,7 +564,14 @@ static void setup() {
     g_status = [[UILabel alloc] initWithFrame:CGRectMake(60, 22, 330, 30)];
     g_status.textColor = UIColor.yellowColor; g_status.font = [UIFont boldSystemFontOfSize:11]; g_status.userInteractionEnabled = NO;
     [w addSubview:g_status];
-    if (prev.length) showStatus([NSString stringWithFormat:@"prev: %@ | skip: %@", prev, [g_skip.allObjects componentsJoinedByString:@","]]);
+    if (prev.length) showStatus([NSString stringWithFormat:@"prev: %@ | bc: %@ | skip: %@", prev, prevBc, [g_skip.allObjects componentsJoinedByString:@","]]);
+    UILabel *dbg = [[UILabel alloc] initWithFrame:CGRectMake(60, 44, 420, 30)];
+    dbg.textColor = UIColor.cyanColor; dbg.font = [UIFont boldSystemFontOfSize:10]; dbg.numberOfLines = 3; dbg.userInteractionEnabled = NO;
+    dbg.text = api; [w addSubview:dbg];
+    [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *t) {
+        NSUInteger np; @synchronized (g_players) { np = g_players.count; }
+        dbg.text = [NSString stringWithFormat:@"%@\ncam=%d local=%d players=%lu target=%d", api, pickCamera() != NULL, g_local != NULL, (unsigned long)np, g_hasTarget];
+    }];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 4 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{ installPatches(); });
 }
 
