@@ -17,7 +17,7 @@ jobs:
             -dynamiclib -std=c++17 -fobjc-arc -Wno-deprecated-declarations \
             -o ChickenMenu.dylib Tweak.mm \
             -framework UIKit -framework Foundation \
-            -framework AudioToolbox -framework QuartzCore -framework CoreGraphics \
+            -framework AudioToolbox -framework AVFoundation -framework QuartzCore -framework CoreGraphics \
             -lc++ \
             -install_name @executable_path/ChickenMenu.dylib
           codesign -f -s - ChickenMenu.dylib
