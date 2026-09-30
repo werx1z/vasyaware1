@@ -18,6 +18,13 @@
 struct Vec3 { float x, y, z; };
 struct Quat { float x, y, z, w; };
 struct Col  { float r, g, b, a; };
+static Col hsvCol(const float *c) {   // h,s,v в 0..1 -> RGB
+    float h = c[0] * 6.f, s = c[1], v = c[2], fl = floorf(h), f = h - fl; int i = (int)fl % 6;
+    float p = v * (1 - s), q = v * (1 - s * f), t = v * (1 - s * (1 - f)); Col o = {0, 0, 0, 1};
+    switch (i) { case 0: o.r = v; o.g = t; o.b = p; break; case 1: o.r = q; o.g = v; o.b = p; break; case 2: o.r = p; o.g = v; o.b = t; break;
+                 case 3: o.r = p; o.g = q; o.b = v; break; case 4: o.r = t; o.g = p; o.b = v; break; default: o.r = v; o.g = p; o.b = q; break; }
+    return o;
+}
 
 // ---------------- настройки ----------------
 static struct {
@@ -30,6 +37,11 @@ static struct {
     float aaPitch = 90.f;    // наклон модели: 90 = смотрит вниз, -90 = вверх
     int   aaMode  = 1;       // 0 jitter, 1 spin, 2 static, 3 random
     bool  killmsg   = true;   // плашка "killed <ник>" сверху
+    float fogC[3] = {0, 0, 0}, skyC[3] = {0, 0, 0};   // HSV, по умолчанию чёрный
+    // цвета ESP (HSV 0..1): верх / низ градиента, по умолчанию белый сверху -> чёрный снизу
+    float boxTop[3] = {0, 0, 1}, boxBot[3] = {0, 0, 0}, barTop[3] = {0, 0, 1}, barBot[3] = {0, 0, 0};
+    bool  hpbar     = true;   // хп-бар у ESP
+    bool  glow      = true;   // свечение вокруг ESP-рамки
     bool  sparks    = true;   // искры при убийстве
     bool  ownAA     = true;   // видеть свой антиаим на своей модели (камера остаётся)
     float headH   = 0.9f;    // высота головы над ногами (умножается на масштаб)
@@ -240,10 +252,10 @@ static void h_Destroy(void *self, void *mi) {
 }
 
 static void applyVisuals() {
-    if (C.fog && RS_fog && RS_fogCol && RS_fogMode && RS_fogDens) { Col k = {0, 0, 0, 1}; RS_fog(true); RS_fogCol(&k); RS_fogMode(2); RS_fogDens(0.1f); }
+    if (C.fog && RS_fog && RS_fogCol && RS_fogMode && RS_fogDens) { Col k = hsvCol(C.fogC); RS_fog(true); RS_fogCol(&k); RS_fogMode(2); RS_fogDens(0.1f); }
     if (C.sky && Cam_clear && Cam_bg) {
         if (RS_skybox) RS_skybox(NULL);
-        void *cam = pickCamera(); Col k = {0, 0, 0, 1};
+        void *cam = pickCamera(); Col k = hsvCol(C.skyC);
         if (cam) { Cam_clear(cam, 2); Cam_bg(cam, &k); }
     }
 }
@@ -416,6 +428,11 @@ static void esText(NSString *t, CGFloat x, CGFloat y, CGFloat sz, CGFloat al) {
     [t drawAtPoint:CGPointMake(x + 1, y + 1) withAttributes:@{NSFontAttributeName: f, NSForegroundColorAttributeName: [UIColor colorWithWhite:0 alpha:0.85 * al]}];
     [t drawAtPoint:CGPointMake(x, y) withAttributes:@{NSFontAttributeName: f, NSForegroundColorAttributeName: [UIColor colorWithWhite:1 alpha:al]}];
 }
+static CGGradientRef mkGrad(const float *top, const float *bot) {   // loc 0 = низ (bot), loc 1 = верх (top); освобождать через CGGradientRelease
+    static CGColorSpaceRef cs; if (!cs) cs = CGColorSpaceCreateDeviceRGB();
+    Col a = hsvCol(bot), b = hsvCol(top); CGFloat comps[] = {a.r, a.g, a.b, 1, b.r, b.g, b.b, 1}; CGFloat locs[] = {0, 1};
+    return CGGradientCreateWithColorComponents(cs, comps, locs, 2);
+}
 static CGGradientRef bwGrad() {   // 0 = чёрный, 1 = белый
     static CGGradientRef g; if (!g) {
         CGColorSpaceRef cs = CGColorSpaceCreateDeviceGray(); CGFloat comps[] = {0, 1, 1, 1}; CGFloat locs[] = {0, 1};
@@ -475,13 +492,14 @@ static CGGradientRef bwGrad() {   // 0 = чёрный, 1 = белый
                 Spark &k = g_sparks[i]; float t = (float)(now - k.born); if (t < 0 || t > k.life) continue; alive_n++;
                 const float G = -14.f;
                 auto at = [&](float tt) { return (Vec3){k.p.x + k.v.x * tt, k.p.y + k.v.y * tt + 0.5f * G * tt * tt, k.p.z + k.v.z * tt}; };
-                Vec3 w0 = at(fmaxf(0, t - 0.04f)), w1 = at(t), s0, s1;
+                Vec3 w0 = at(fmaxf(0, t - 0.05f)), w1 = at(t), s0, s1;
                 Cam_w2s(cam, &w0, 2, &s0); Cam_w2s(cam, &w1, 2, &s1);
                 if (s0.z <= 0 || s1.z <= 0) continue;
                 CGPoint p0 = CGPointMake(s0.x / sw * S.width, (1 - s0.y / sh) * S.height), p1 = CGPointMake(s1.x / sw * S.width, (1 - s1.y / sh) * S.height);
                 float f = 1.f - t / k.life;   // 1 -> 0
-                CGContextSetStrokeColorWithColor(c, [UIColor colorWithRed:1 green:0.35f + 0.6f * f blue:0.1f + 0.3f * f * f alpha:f].CGColor);
-                CGContextSetLineWidth(c, k.size * (0.5f + f));
+                CGContextSetRGBStrokeColor(c, 0.8f, 0.9f, 1, 0.20f * f); CGContextSetLineWidth(c, 3.4f);     // свечение
+                CGContextMoveToPoint(c, p0.x, p0.y); CGContextAddLineToPoint(c, p1.x, p1.y); CGContextStrokePath(c);
+                CGContextSetRGBStrokeColor(c, 1, 1, 1, fminf(1.f, f * 1.4f)); CGContextSetLineWidth(c, 0.45f + 0.2f * k.size * f);   // тонкое белое ядро
                 CGContextMoveToPoint(c, p0.x, p0.y); CGContextAddLineToPoint(c, p1.x, p1.y); CGContextStrokePath(c);
             }
             CGContextRestoreGState(c);
@@ -492,6 +510,7 @@ static CGGradientRef bwGrad() {   // 0 = чёрный, 1 = белый
     bc("esp"); void *cam = pickCamera(); if (!cam) { bc("idle"); return; }
     float sw = Scr_w(), sh = Scr_h(); if (sw < 1 || sh < 1) { bc("idle"); return; }
     NSArray *all; @synchronized (g_players) { all = g_players.allObjects; }
+    CGGradientRef gBox = mkGrad(C.boxTop, C.boxBot), gBar = mkGrad(C.barTop, C.barBot); Col glowC = hsvCol(C.boxTop);
     for (NSNumber *n in all) {
         void *p = (void *)n.unsignedLongValue; if (p == g_local || !alive(p)) continue;
         Vec3 f = posOf(p), h = f; h.y += C.headH * scaleOf(p) * 1.3f;
@@ -503,25 +522,37 @@ static CGGradientRef bwGrad() {   // 0 = чёрный, 1 = белый
         if (bh < 4) continue;
         { CGFloat mid = y + bh / 2; bh *= 1.15; bw = bh * 0.75; x = (fx + hx) / 2 - bw / 2; y = mid - bh / 2; }   // рамка чуть крупнее
         CGRect box = CGRectMake(x, y, bw, bh); float hp = fmaxf(0, fminf(100, getHP(p)));
+        if (C.glow) {   // мягкое белое свечение: несколько расширяющихся полупрозрачных обводок с аддитивным смешиванием
+            CGPathRef gp = CGPathCreateWithRoundedRect(box, 3, 3, NULL);
+            CGContextSaveGState(c); CGContextSetBlendMode(c, kCGBlendModePlusLighter); CGContextSetLineJoin(c, kCGLineJoinRound);
+            for (int gi = 0; gi < 4; gi++) {
+                CGContextSetRGBStrokeColor(c, glowC.r, glowC.g, glowC.b, 0.16f - gi * 0.035f); CGContextSetLineWidth(c, 4 + gi * 4);
+                CGContextAddPath(c, gp); CGContextStrokePath(c);
+            }
+            CGContextRestoreGState(c); CGPathRelease(gp);
+        }
         // подложка, чтобы чёрный конец градиента был виден на тёмном фоне
         CGContextSetStrokeColorWithColor(c, [UIColor colorWithWhite:0.22 alpha:0.7].CGColor); CGContextSetLineWidth(c, 3); CGContextStrokeRect(c, box);
         // рамка с градиентом: снизу чёрный -> сверху белый
         CGContextSaveGState(c); CGContextSetLineWidth(c, 1.2); CGContextAddRect(c, box); CGContextReplacePathWithStrokedPath(c); CGContextClip(c);
-        CGContextDrawLinearGradient(c, bwGrad(), CGPointMake(0, y + bh), CGPointMake(0, y), 0); CGContextRestoreGState(c);
+        CGContextDrawLinearGradient(c, gBox, CGPointMake(0, y + bh), CGPointMake(0, y), 0); CGContextRestoreGState(c);
+        if (C.hpbar) {
         // хп-бар слева: чёрный снизу, белый сверху
         CGFloat bx = x - 6, bwid = 2.5, fh = bh * hp / 100.f;
         CGContextSetFillColorWithColor(c, [UIColor colorWithWhite:0.10 alpha:0.85].CGColor); CGContextFillRect(c, CGRectMake(bx - 1, y - 1, bwid + 2, bh + 2));
         CGContextSaveGState(c); CGContextClipToRect(c, CGRectMake(bx, y + bh - fh, bwid, fh));
-        CGContextDrawLinearGradient(c, bwGrad(), CGPointMake(0, y + bh), CGPointMake(0, y), 0); CGContextRestoreGState(c);
+        CGContextDrawLinearGradient(c, gBar, CGPointMake(0, y + bh), CGPointMake(0, y), 0); CGContextRestoreGState(c);
         CGContextSetStrokeColorWithColor(c, [UIColor colorWithWhite:0.32 alpha:1].CGColor); CGContextSetLineWidth(c, 1);
         CGContextStrokeRect(c, CGRectMake(bx - 0.5, y - 0.5, bwid + 1, bh + 1));
         // текст: хп у уровня бара, ник над боксом
         NSString *hs = [NSString stringWithFormat:@"%d", (int)hp];
         CGFloat hy2 = fmax(y - 2, fmin(y + bh - 8, y + bh - fh - 4));
         esText(hs, bx - 3 - esWidth(hs, 8), hy2, 8, 1);
+        }
         NSString *nk = nickOf(p); if (nk.length > 16) nk = [nk substringToIndex:16];
         esText(nk, x + bw / 2 - esWidth(nk, 9) / 2, y - 13, 9, 1);
     }
+    CGGradientRelease(gBox); CGGradientRelease(gBar);
     bc("idle");
 }
 @end
@@ -676,6 +707,38 @@ static UIWindow *keyWin() {
     return UIApplication.sharedApplication.windows.firstObject;
 }
 
+@interface GSColor : UIView
+@property (nonatomic) float *hsv; @property (nonatomic, copy) NSString *title; @property (nonatomic) int active; @property (nonatomic, copy) void (^changed)(void);
+@end
+@implementation GSColor
+- (void)drawRect:(CGRect)r {
+    if (!_hsv) return; CGFloat W = self.bounds.size.width, bw = W - 3;
+    [_title drawAtPoint:CGPointMake(0, 0) withAttributes:@{NSFontAttributeName: gsF(9), NSForegroundColorAttributeName: GSC(150)}];
+    Col cc = hsvCol(_hsv); CGRect sw = CGRectMake(W - 24.5, 0.5, 24, 10);
+    [[UIColor colorWithRed:cc.r green:cc.g blue:cc.b alpha:1] setFill]; UIRectFill(sw);
+    UIBezierPath *sb = [UIBezierPath bezierPathWithRect:sw]; sb.lineWidth = 1; [GSC(90) setStroke]; [sb stroke];
+    for (int i = 0; i < 3; i++) {
+        CGFloat by = 14 + i * 9;
+        [GSC(20) setFill]; UIRectFill(CGRectMake(0.5, by, W - 1, 8));
+        for (CGFloat px = 0; px < bw; px += 2) {
+            float f = (float)(px / bw), t[3] = {_hsv[0], _hsv[1], _hsv[2]};
+            if (i == 0) { t[0] = f; t[1] = 1; t[2] = 1; } else if (i == 1) { t[1] = f; t[2] = 1; } else { t[2] = f; }
+            Col k = hsvCol(t); [[UIColor colorWithRed:k.r green:k.g blue:k.b alpha:1] setFill]; UIRectFill(CGRectMake(1.5 + px, by + 1.5, 2, 5));
+        }
+        UIBezierPath *b = [UIBezierPath bezierPathWithRect:CGRectMake(0.5, by + 0.5, W - 1, 7)]; b.lineWidth = 1; [GSC(62) setStroke]; [b stroke];
+        CGFloat mx = 1.5 + bw * _hsv[i];
+        [GSC(0) setFill]; UIRectFill(CGRectMake(mx - 1.5, by, 3, 8)); [GSC(245) setFill]; UIRectFill(CGRectMake(mx - 0.5, by, 1, 8));
+    }
+}
+- (void)applyTouch:(UITouch *)u {
+    CGFloat f = ([u locationInView:self].x - 1.5) / (self.bounds.size.width - 3); f = MAX(0.0, MIN(1.0, f));
+    if (_hsv) _hsv[_active] = (float)f; [self setNeedsDisplay]; if (_changed) _changed();
+}
+- (void)touchesBegan:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e {
+    int i = (int)(([t.anyObject locationInView:self].y - 12) / 9); _active = MAX(0, MIN(2, i)); [self applyTouch:t.anyObject];
+}
+- (void)touchesMoved:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e { [self applyTouch:t.anyObject]; }
+@end
 static UIView *gsGroup(UIView *parent, NSString *title, CGFloat y, CGFloat w) {
     UIView *g = [[UIView alloc] initWithFrame:CGRectMake(0, y, w, 40)];
     g.backgroundColor = GSC(13); g.layer.borderColor = GSC(46).CGColor; g.layer.borderWidth = 1;
@@ -692,6 +755,46 @@ static CGFloat gsSlider(UIView *g, CGFloat y, const char *nm, float *p, float mn
     GSSlider *s = [[GSSlider alloc] initWithFrame:CGRectMake(10, y, g.bounds.size.width - 20, 28)];
     s.backgroundColor = UIColor.clearColor; s.p = p; s.mn = mn; s.mx = mx; s.step = step; s.fmt = fmt;
     s.title = [NSString stringWithUTF8String:nm]; [g addSubview:s]; return y + 31;
+}
+static UIView *g_pop; static float *g_popHSV;
+@interface GSSwatch : UIView
+@property (nonatomic) float *c1, *c2; @property (nonatomic, weak) UIView *host; @property (nonatomic, copy) NSString *title;
+@end
+@implementation GSSwatch
+- (void)drawRect:(CGRect)r {
+    int n = _c2 ? 2 : 1;
+    for (int i = 0; i < n; i++) {
+        float *h = i == 0 ? _c1 : _c2; Col k = hsvCol(h); CGRect sq = CGRectMake(1.5 + i * 27, 1.5, 24, 10);
+        [[UIColor colorWithRed:k.r green:k.g blue:k.b alpha:1] setFill]; UIRectFill(sq);
+        UIBezierPath *b = [UIBezierPath bezierPathWithRect:sq]; b.lineWidth = 1; [(g_pop && g_popHSV == h ? GSC(245) : GSC(90)) setStroke]; [b stroke];
+    }
+}
+- (void)touchesEnded:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e {
+    CGPoint p = [t.anyObject locationInView:self]; if (!CGRectContainsPoint(self.bounds, p)) return;
+    float *h = (_c2 && p.x > 27) ? _c2 : _c1;
+    BOOL same = g_pop && g_popHSV == h;
+    [g_pop removeFromSuperview]; g_pop = nil; g_popHSV = NULL;
+    if (!same && _host) {
+        CGRect row = [self convertRect:self.bounds toView:_host]; CGFloat pw = 220, ph = 54;
+        CGFloat x = MIN(_host.bounds.size.width - pw - 2, CGRectGetMaxX(row) - pw), y = CGRectGetMaxY(row) + 3;
+        if (y + ph > _host.bounds.size.height) y = CGRectGetMinY(row) - ph - 3;
+        UIView *pop = [[UIView alloc] initWithFrame:CGRectMake(x, y, pw, ph)];
+        pop.backgroundColor = GSC(17); pop.layer.borderColor = GSC(80).CGColor; pop.layer.borderWidth = 1;
+        GSColor *pk = [[GSColor alloc] initWithFrame:CGRectMake(8, 7, pw - 16, 40)]; pk.backgroundColor = UIColor.clearColor; pk.hsv = h;
+        pk.title = _c2 ? [NSString stringWithFormat:@"%@ - %@", _title, h == _c1 ? @"color 1 (top)" : @"color 2 (bottom)"] : [NSString stringWithFormat:@"%@ color", _title];
+        __weak GSSwatch *ws = self; pk.changed = ^{ [ws setNeedsDisplay]; };
+        [pop addSubview:pk]; [_host addSubview:pop]; [_host bringSubviewToFront:pop]; g_pop = pop; g_popHSV = h;
+    }
+    [self setNeedsDisplay];
+}
+@end
+static void gsSwatch(UIView *g, UIView *host, CGFloat rowY, const char *nm, float *c1, float *c2) {   // квадратики цвета справа в строке
+    CGFloat w = c2 ? 54 : 27; GSSwatch *sw = [[GSSwatch alloc] initWithFrame:CGRectMake(g.bounds.size.width - 10 - w, rowY + 4, w, 13)];
+    sw.backgroundColor = UIColor.clearColor; sw.c1 = c1; sw.c2 = c2; sw.host = host; sw.title = [NSString stringWithUTF8String:nm]; [g addSubview:sw];
+}
+static CGFloat gsColor(UIView *g, CGFloat y, const char *nm, float *hsv) {
+    GSColor *c = [[GSColor alloc] initWithFrame:CGRectMake(10, y, g.bounds.size.width - 20, 40)];
+    c.backgroundColor = UIColor.clearColor; c.hsv = hsv; c.title = [NSString stringWithUTF8String:nm]; [g addSubview:c]; return y + 43;
 }
 static CGFloat gsCombo(UIView *g, CGFloat y, const char *nm, int *p, NSArray<NSString *> *opts) {
     GSCombo *c = [[GSCombo alloc] initWithFrame:CGRectMake(10, y, g.bounds.size.width - 20, 32)];
@@ -754,13 +857,14 @@ static void buildUI() {
         gsFit(g, y);
     }
     { // VISUALS
-        UIView *pg = g_pages[2]; UIView *g = gsGroup(pg, @"esp", 8, CW); CGFloat y = 14;
-        y = gsCheck(g, y, "ESP boxes / nick / hp", &C.esp);
-        y = gsCheck(g, y, "Hitmarker", &C.hitm);
+        UIView *pg = g_pages[2]; UIView *g = gsGroup(pg, @"esp", 8, CW); CGFloat y = 14, y0;
+        y0 = y; y = gsCheck(g, y, "ESP box / nick", &C.esp); gsSwatch(g, pg, y0, "Box", C.boxTop, C.boxBot);
+        y0 = y; y = gsCheck(g, y, "HP bar", &C.hpbar);       gsSwatch(g, pg, y0, "HP bar", C.barTop, C.barBot);
+        y = gsCheck(g, y, "Glow", &C.glow);
         CGFloat ny = gsFit(g, y);
         g = gsGroup(pg, @"world", ny, CW); y = 14;
-        y = gsCheck(g, y, "Black fog", &C.fog);
-        y = gsCheck(g, y, "Black sky", &C.sky);
+        y0 = y; y = gsCheck(g, y, "Fog", &C.fog); gsSwatch(g, pg, y0, "Fog", C.fogC, NULL);
+        y0 = y; y = gsCheck(g, y, "Sky", &C.sky); gsSwatch(g, pg, y0, "Sky", C.skyC, NULL);
         gsFit(g, y);
     }
     { // MISC
@@ -769,6 +873,7 @@ static void buildUI() {
         y = gsSlider(g, y, "Speed multiplier", &C.bhopMul, 1.0f, 3.0f, 0.05f, @"%.2fx");
         CGFloat ny = gsFit(g, y);
         g = gsGroup(pg, @"feedback", ny, CW); y = 14;
+        y = gsCheck(g, y, "Hitmarker", &C.hitm);
         y = gsCheck(g, y, "Hitsound", &C.hitsnd);
         y = gsCheck(g, y, "Killsound", &C.killsnd);
         y = gsCheck(g, y, "Kill message", &C.killmsg);
