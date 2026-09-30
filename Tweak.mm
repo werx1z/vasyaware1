@@ -42,6 +42,7 @@ static struct {
     float boxTop[3] = {0, 0, 1}, boxBot[3] = {0, 0, 0}, barTop[3] = {0, 0, 1}, barBot[3] = {0, 0, 0};
     bool  aspectOn  = false;  // растянутое разрешение
     float aspect    = 1.33f;  // пропорция камеры (4:3 = 1.33)
+    bool  dist      = true;   // дистанция под ESP
     bool  hpbar     = true;   // хп-бар у ESP
     bool  glow      = true;   // свечение вокруг ESP-рамки
     bool  sparks    = true;   // искры при убийстве
@@ -519,7 +520,7 @@ static CGGradientRef bwGrad() {   // 0 = чёрный, 1 = белый
     bc("esp"); void *cam = pickCamera(); if (!cam) { bc("idle"); return; }
     float sw = Scr_w(), sh = Scr_h(); if (sw < 1 || sh < 1) { bc("idle"); return; }
     NSArray *all; @synchronized (g_players) { all = g_players.allObjects; }
-    CGGradientRef gBox = mkGrad(C.boxTop, C.boxBot), gBar = mkGrad(C.barTop, C.barBot); Col glowC = hsvCol(C.boxTop);
+    CGGradientRef gBox = mkGrad(C.boxTop, C.boxBot), gBar = mkGrad(C.barTop, C.barBot); Col glowC = hsvCol(C.boxTop); Vec3 myPos = posOf(g_local);
     for (NSNumber *n in all) {
         void *p = (void *)n.unsignedLongValue; if (p == g_local || !alive(p)) continue;
         Vec3 f = posOf(p), h = f; h.y += C.headH * scaleOf(p) * 1.3f;
@@ -560,6 +561,11 @@ static CGGradientRef bwGrad() {   // 0 = чёрный, 1 = белый
         }
         NSString *nk = nickOf(p); if (nk.length > 16) nk = [nk substringToIndex:16];
         esText(nk, x + bw / 2 - esWidth(nk, 9) / 2, y - 13, 9, 1);
+        if (C.dist) {   // дистанция под рамкой
+            float ddx = f.x - myPos.x, ddy = f.y - myPos.y, ddz = f.z - myPos.z;
+            NSString *ds = [NSString stringWithFormat:@"%dm", (int)lroundf(sqrtf(ddx * ddx + ddy * ddy + ddz * ddz))];
+            esText(ds, x + bw / 2 - esWidth(ds, 8) / 2, y + bh + 2, 8, 1);
+        }
     }
     CGGradientRelease(gBox); CGGradientRelease(gBar);
     bc("idle");
@@ -870,6 +876,7 @@ static void buildUI() {
         y0 = y; y = gsCheck(g, y, "ESP box / nick", &C.esp); gsSwatch(g, pg, y0, "Box", C.boxTop, C.boxBot);
         y0 = y; y = gsCheck(g, y, "HP bar", &C.hpbar);       gsSwatch(g, pg, y0, "HP bar", C.barTop, C.barBot);
         y = gsCheck(g, y, "Glow", &C.glow);
+        y = gsCheck(g, y, "Distance", &C.dist);
         CGFloat ny = gsFit(g, y);
         g = gsGroup(pg, @"world", ny, CW); y = 14;
         y0 = y; y = gsCheck(g, y, "Fog", &C.fog); gsSwatch(g, pg, y0, "Fog", C.fogC, NULL);
