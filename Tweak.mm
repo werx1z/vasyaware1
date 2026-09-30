@@ -8,6 +8,9 @@
 #include <math.h>
 #include <string.h>
 #include <stdint.h>
+#include <ctype.h>
+#include <string.h>
+#include <math.h>
 #include <stddef.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -27,8 +30,7 @@ static struct {
     float aaPitch = 90.f;    // наклон модели: 90 = смотрит вниз, -90 = вверх
     int   aaMode  = 1;       // 0 jitter, 1 spin, 2 static, 3 random
     bool  killmsg   = true;   // плашка "killed <ник>" сверху
-    bool  selfSpin  = false;  // крутить свою модель у себя на экране
-    float selfSpeed = 360.f;  // градусов в секунду
+    bool  sparks    = true;   // искры при убийстве
     float headH   = 0.9f;    // высота головы над ногами (умножается на масштаб)
 } C;
 
@@ -76,7 +78,7 @@ static uintptr_t B;
 #define FN(rva, ret, ...) ((ret (*)(__VA_ARGS__))(B + (rva)))
 static NSMutableSet<NSNumber *> *g_players;
 static void *g_local;
-static double g_hitTime;
+static double g_hitTime; static float g_hitDmg;
 static int g_gameFrames;   // кадры игры (для фпс в ватермарке)
 static AVAudioPlayer *g_hitP, *g_killP;
 static void initSounds() {
@@ -84,7 +86,12 @@ static void initSounds() {
     g_killP = [[AVAudioPlayer alloc] initWithData:[NSData dataWithBytes:kill_wav length:kill_wav_len] error:nil];
     g_hitP.volume = 1.0; g_killP.volume = 1.0; [g_hitP prepareToPlay]; [g_killP prepareToPlay];
 }
-static void playSnd(AVAudioPlayer *p) { if (!p) return; p.currentTime = 0; [p play]; }
+static dispatch_queue_t g_sndQ;
+static void playSnd(AVAudioPlayer *p) {   // не в игровом потоке: play() на нём даёт микрофриз при каждом попадании
+    if (!p) return;
+    if (!g_sndQ) g_sndQ = dispatch_queue_create("cm.snd", DISPATCH_QUEUE_SERIAL);
+    dispatch_async(g_sndQ, ^{ p.currentTime = 0; [p play]; });
+}
 
 static uintptr_t getBase(const char *name) {
     for (uint32_t i = 0; i < _dyld_image_count(); i++) {
@@ -155,9 +162,7 @@ static void bc(const char *s) {
     memcpy(b, s, n); b[39] = '\n'; pwrite(g_bcFd, b, sizeof b, 0);
 }
 static void *pickCamera();
-static void applySelfSpin(void *root);
 static void dumpHierarchy();
-static bool g_hasLate;
 
 // ---------------- таблица оригинальных указателей ----------------
 struct OrigE { void *mi; void *fn; };
@@ -178,20 +183,33 @@ static Quat qmul(Quat a, Quat b) {
 // ---------------- обработчики ----------------
 // ---------------- плашка "killed <ник>" ----------------
 static NSString *g_killNick; static double g_killT;
-static double g_fragT, g_deathT; static NSString *g_deathNick; static bool g_fragPend, g_deathFresh;
+static double g_fragT, g_deathT; static NSString *g_deathNick; static Vec3 g_deathPos; static bool g_fragPend, g_deathFresh;
 static NSMutableDictionary<NSNumber *, NSNumber *> *g_aliveMap;
-static void showKill(NSString *n) {
+// ---------------- искры при убийстве (мировые частицы, проецируются в 2D) ----------------
+struct Spark { Vec3 p, v; double born; float life, size; };
+static Spark g_sparks[160]; static int g_nSparks;
+static float frand(float a, float b) { return a + (float)arc4random_uniform(10001) / 10000.f * (b - a); }
+static void spawnSparks(Vec3 c) {
+    g_nSparks = 0; double now = CACurrentMediaTime();
+    for (int i = 0; i < 90 && g_nSparks < 160; i++) {
+        float th = frand(0, 2 * (float)M_PI), up = frand(-0.15f, 1.0f), r = sqrtf(fmaxf(0, 1 - up * up)), sp = frand(2.5f, 9.f);
+        g_sparks[g_nSparks++] = (Spark){ c, {cosf(th) * r * sp, up * sp * 0.9f + 1.5f, sinf(th) * r * sp}, now, frand(0.45f, 1.1f), frand(1.0f, 2.2f) };
+    }
+}
+static void showKill(NSString *n, const Vec3 *at) {
     g_fragPend = false; g_deathFresh = false;
+    if (at && C.sparks) spawnSparks(*at);
     if (!C.killmsg) return;
     g_killNick = n.length ? n : @"?"; g_killT = CACurrentMediaTime();
 }
 static void onFrag() {
     double now = CACurrentMediaTime();
-    if (g_deathFresh && now - g_deathT < 1.0) showKill(g_deathNick); else { g_fragPend = true; g_fragT = now; }
+    if (g_deathFresh && now - g_deathT < 1.0) showKill(g_deathNick, &g_deathPos); else { g_fragPend = true; g_fragT = now; }
 }
 static void onDeath(void *p) {
     double now = CACurrentMediaTime(); NSString *n = nickOf(p);
-    if (g_fragPend && now - g_fragT < 1.0) showKill(n); else { g_deathNick = n; g_deathT = now; g_deathFresh = true; }
+    Vec3 pos = posOf(p); pos.y += C.headH * scaleOf(p) * 0.6f;   // примерно центр тела
+    if (g_fragPend && now - g_fragT < 1.0) showKill(n, &pos); else { g_deathNick = n; g_deathPos = pos; g_deathT = now; g_deathFresh = true; }
 }
 static void trackDeaths() {   // ищем игроков, которые только что умерли
     if (!g_aliveMap) return;
@@ -202,7 +220,7 @@ static void trackDeaths() {   // ищем игроков, которые тол�
         if (prev && prev.boolValue && !a) onDeath(p);
         g_aliveMap[n] = @(a);
     }
-    if (g_fragPend && CACurrentMediaTime() - g_fragT > 0.6) showKill(@"player");   // ник не определился
+    if (g_fragPend && CACurrentMediaTime() - g_fragT > 0.6) showKill(@"player", g_hasTarget ? &g_aim : NULL);   // ник не определился
 }
 
 static void h_Start(void *self, void *mi) {
@@ -268,12 +286,6 @@ static void h_Update(void *self, void *mi) {
         *sp = g_baseSpeed * C.bhopMul;
         if (FN(RVA_CM_IsGrounded, bool, void *, void *)(self, NULL)) FN(RVA_CM_Jump, void, void *, void *)(self, NULL);
     } else if (g_baseSpeed != 0) { *(float *)((uintptr_t)self + OFF_CM_Speed) = g_baseSpeed; }
-    if (!g_hasLate) applySelfSpin(self);
-}
-
-static void h_Late(void *self, void *mi) {
-    fn_v_t o = (fn_v_t)origOf(mi); if (o) o(self, mi);
-    if (self == g_local) applySelfSpin(self);
 }
 
 // silent aim на самой пуле (Update у BaseBulletScript и подклассов)
@@ -313,7 +325,9 @@ static void h_Damage(void *self, float dmg, int from, void *mi) {
     bc("dmg:post");
     if (g_dmgLog < 15) { g_dmgLog++; NSLog(@"[HIT] dmg=%f from=%d local=%d", dmg, from, g_local ? viewID(g_local) : -1); }
     if (g_local && from == viewID(g_local)) {
-        g_hitTime = CACurrentMediaTime();
+        double now = CACurrentMediaTime();
+        g_hitDmg = (now - g_hitTime < 0.25) ? g_hitDmg + dmg : dmg;   // dtap / несколько пуль складываем
+        g_hitTime = now;
         if (C.hitsnd) playSnd(g_hitP);
     }
     bc("idle");
@@ -378,17 +392,104 @@ static void h_SendNext(void *self, void *obj, void *mi) {
 
 // ---------------- ESP ----------------
 static UIFont *gsF(CGFloat s);
+// ---------------- пиксельный шрифт 5x7 + чёрно-белый градиент ----------------
+static const char *PX_SET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ .:-_!?[]()+/|#*";
+static const uint8_t PX_G[][7] = {
+    {0x0E,0x11,0x13,0x15,0x19,0x11,0x0E},
+    {0x04,0x0C,0x04,0x04,0x04,0x04,0x0E},
+    {0x0E,0x11,0x01,0x02,0x04,0x08,0x1F},
+    {0x1E,0x01,0x01,0x0E,0x01,0x01,0x1E},
+    {0x02,0x06,0x0A,0x12,0x1F,0x02,0x02},
+    {0x1F,0x10,0x1E,0x01,0x01,0x11,0x0E},
+    {0x06,0x08,0x10,0x1E,0x11,0x11,0x0E},
+    {0x1F,0x01,0x02,0x04,0x08,0x08,0x08},
+    {0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E},
+    {0x0E,0x11,0x11,0x0F,0x01,0x02,0x0C},
+    {0x0E,0x11,0x11,0x1F,0x11,0x11,0x11},
+    {0x1E,0x11,0x11,0x1E,0x11,0x11,0x1E},
+    {0x0E,0x11,0x10,0x10,0x10,0x11,0x0E},
+    {0x1C,0x12,0x11,0x11,0x11,0x12,0x1C},
+    {0x1F,0x10,0x10,0x1E,0x10,0x10,0x1F},
+    {0x1F,0x10,0x10,0x1E,0x10,0x10,0x10},
+    {0x0E,0x11,0x10,0x17,0x11,0x11,0x0F},
+    {0x11,0x11,0x11,0x1F,0x11,0x11,0x11},
+    {0x0E,0x04,0x04,0x04,0x04,0x04,0x0E},
+    {0x07,0x02,0x02,0x02,0x02,0x12,0x0C},
+    {0x11,0x12,0x14,0x18,0x14,0x12,0x11},
+    {0x10,0x10,0x10,0x10,0x10,0x10,0x1F},
+    {0x11,0x1B,0x15,0x15,0x11,0x11,0x11},
+    {0x11,0x11,0x19,0x15,0x13,0x11,0x11},
+    {0x0E,0x11,0x11,0x11,0x11,0x11,0x0E},
+    {0x1E,0x11,0x11,0x1E,0x10,0x10,0x10},
+    {0x0E,0x11,0x11,0x11,0x15,0x12,0x0D},
+    {0x1E,0x11,0x11,0x1E,0x14,0x12,0x11},
+    {0x0F,0x10,0x10,0x0E,0x01,0x01,0x1E},
+    {0x1F,0x04,0x04,0x04,0x04,0x04,0x04},
+    {0x11,0x11,0x11,0x11,0x11,0x11,0x0E},
+    {0x11,0x11,0x11,0x11,0x11,0x0A,0x04},
+    {0x11,0x11,0x11,0x15,0x15,0x15,0x0A},
+    {0x11,0x11,0x0A,0x04,0x0A,0x11,0x11},
+    {0x11,0x11,0x0A,0x04,0x04,0x04,0x04},
+    {0x1F,0x01,0x02,0x04,0x08,0x10,0x1F},
+    {0x00,0x00,0x00,0x00,0x00,0x00,0x00},
+    {0x00,0x00,0x00,0x00,0x00,0x0C,0x0C},
+    {0x00,0x0C,0x0C,0x00,0x0C,0x0C,0x00},
+    {0x00,0x00,0x00,0x1F,0x00,0x00,0x00},
+    {0x00,0x00,0x00,0x00,0x00,0x00,0x1F},
+    {0x04,0x04,0x04,0x04,0x04,0x00,0x04},
+    {0x0E,0x11,0x01,0x02,0x04,0x00,0x04},
+    {0x0E,0x08,0x08,0x08,0x08,0x08,0x0E},
+    {0x0E,0x02,0x02,0x02,0x02,0x02,0x0E},
+    {0x02,0x04,0x08,0x08,0x08,0x04,0x02},
+    {0x08,0x04,0x02,0x02,0x02,0x04,0x08},
+    {0x00,0x04,0x04,0x1F,0x04,0x04,0x00},
+    {0x01,0x01,0x02,0x04,0x08,0x10,0x10},
+    {0x04,0x04,0x04,0x04,0x04,0x04,0x04},
+    {0x0A,0x0A,0x1F,0x0A,0x1F,0x0A,0x0A},
+    {0x00,0x15,0x0E,0x1F,0x0E,0x15,0x00}
+};
+static CGFloat pxWidth(NSString *s, CGFloat sc) { return s.length ? (s.length * 6 - 1) * sc : 0; }
+static void pxText(CGContextRef c, NSString *s, CGFloat x, CGFloat y, CGFloat sc, CGFloat al) {   // белый текст с чёрной тенью
+    CGMutablePathRef p = CGPathCreateMutable();
+    for (NSUInteger i = 0; i < s.length; i++) {
+        unichar ch = [s characterAtIndex:i]; if (ch < 128) ch = (unichar)toupper((int)ch);
+        const char *q = (ch > 0 && ch < 128) ? strchr(PX_SET, (int)ch) : NULL;
+        if (!q) q = strchr(PX_SET, '?');   // символы вне набора (кириллица и т.п.) -> '?'
+        const uint8_t *g = PX_G[q - PX_SET];
+        for (int r = 0; r < 7; r++) for (int cc = 0; cc < 5; cc++)
+            if (g[r] & (16 >> cc)) CGPathAddRect(p, NULL, CGRectMake(x + (i * 6 + cc) * sc, y + r * sc, sc, sc));
+    }
+    CGContextSaveGState(c); CGContextTranslateCTM(c, 1, 1);
+    CGContextSetFillColorWithColor(c, [UIColor colorWithWhite:0 alpha:0.85 * al].CGColor); CGContextAddPath(c, p); CGContextFillPath(c);
+    CGContextRestoreGState(c);
+    CGContextSetFillColorWithColor(c, [UIColor colorWithWhite:1 alpha:al].CGColor); CGContextAddPath(c, p); CGContextFillPath(c);
+    CGPathRelease(p);
+}
+static CGGradientRef bwGrad() {   // 0 = чёрный, 1 = белый
+    static CGGradientRef g; if (!g) {
+        CGColorSpaceRef cs = CGColorSpaceCreateDeviceGray(); CGFloat comps[] = {0, 1, 1, 1}; CGFloat locs[] = {0, 1};
+        g = CGGradientCreateWithColorComponents(cs, comps, locs, 2); CGColorSpaceRelease(cs);
+    } return g;
+}
+
 @interface ESPView : UIView @end
 @implementation ESPView
 - (void)drawRect:(CGRect)r {
     CGContextRef c = UIGraphicsGetCurrentContext(); CGSize S = self.bounds.size;
-    if (C.hitm && CACurrentMediaTime() - g_hitTime < 0.25) {
-        CGFloat cx = S.width / 2, cy = S.height / 2, a = 8, b = 20;
-        CGContextSetStrokeColorWithColor(c, UIColor.whiteColor.CGColor); CGContextSetLineWidth(c, 2);
-        for (int sx = -1; sx <= 1; sx += 2) for (int sy = -1; sy <= 1; sy += 2) {
-            CGContextMoveToPoint(c, cx + sx * a, cy + sy * a); CGContextAddLineToPoint(c, cx + sx * b, cy + sy * b);
+    if (C.hitm) {
+        double age = CACurrentMediaTime() - g_hitTime; CGFloat cx = S.width / 2, cy = S.height / 2, a = 8, b = 20;
+        if (age < 0.25) {
+            CGContextSetStrokeColorWithColor(c, UIColor.whiteColor.CGColor); CGContextSetLineWidth(c, 2);
+            for (int sx = -1; sx <= 1; sx += 2) for (int sy = -1; sy <= 1; sy += 2) {
+                CGContextMoveToPoint(c, cx + sx * a, cy + sy * a); CGContextAddLineToPoint(c, cx + sx * b, cy + sy * b);
+            }
+            CGContextStrokePath(c);
         }
-        CGContextStrokePath(c);
+        if (age < 0.8) {   // надпись слева от хитмаркера
+            CGFloat al = age > 0.5 ? (0.8 - age) / 0.3 : 1.0;
+            NSString *t = [NSString stringWithFormat:@"SHOOT -%d", (int)lroundf(g_hitDmg)];
+            pxText(c, t, cx - b - 10 - pxWidth(t, 2), cy - 7, 2, al);
+        }
     }
     if (g_killNick) {
         double age = CACurrentMediaTime() - g_killT;
@@ -415,6 +516,27 @@ static UIFont *gsF(CGFloat s);
             [g_killNick drawAtPoint:CGPointMake(bx + 14 + w1, by + 6) withAttributes:a2];
         }
     }
+    if (g_nSparks && Cam_w2s && Scr_w && Scr_h) {
+        void *cam = pickCamera(); float sw = Scr_w(), sh = Scr_h(); double now = CACurrentMediaTime(); int alive_n = 0;
+        if (cam && sw > 1 && sh > 1) {
+            CGContextSaveGState(c); CGContextSetBlendMode(c, kCGBlendModePlusLighter); CGContextSetLineCap(c, kCGLineCapRound);
+            for (int i = 0; i < g_nSparks; i++) {
+                Spark &k = g_sparks[i]; float t = (float)(now - k.born); if (t < 0 || t > k.life) continue; alive_n++;
+                const float G = -14.f;
+                auto at = [&](float tt) { return (Vec3){k.p.x + k.v.x * tt, k.p.y + k.v.y * tt + 0.5f * G * tt * tt, k.p.z + k.v.z * tt}; };
+                Vec3 w0 = at(fmaxf(0, t - 0.04f)), w1 = at(t), s0, s1;
+                Cam_w2s(cam, &w0, 2, &s0); Cam_w2s(cam, &w1, 2, &s1);
+                if (s0.z <= 0 || s1.z <= 0) continue;
+                CGPoint p0 = CGPointMake(s0.x / sw * S.width, (1 - s0.y / sh) * S.height), p1 = CGPointMake(s1.x / sw * S.width, (1 - s1.y / sh) * S.height);
+                float f = 1.f - t / k.life;   // 1 -> 0
+                CGContextSetStrokeColorWithColor(c, [UIColor colorWithRed:1 green:0.35f + 0.6f * f blue:0.1f + 0.3f * f * f alpha:f].CGColor);
+                CGContextSetLineWidth(c, k.size * (0.5f + f));
+                CGContextMoveToPoint(c, p0.x, p0.y); CGContextAddLineToPoint(c, p1.x, p1.y); CGContextStrokePath(c);
+            }
+            CGContextRestoreGState(c);
+        }
+        if (!alive_n) g_nSparks = 0;
+    }
     if (!C.esp || !g_local || !Cam_w2s || !Scr_w || !Scr_h) return;
     bc("esp"); void *cam = pickCamera(); if (!cam) { bc("idle"); return; }
     float sw = Scr_w(), sh = Scr_h(); if (sw < 1 || sh < 1) { bc("idle"); return; }
@@ -427,11 +549,26 @@ static UIFont *gsF(CGFloat s);
         CGFloat fx = sf.x / sw * S.width,  fy = (1 - sf.y / sh) * S.height;
         CGFloat hx = shd.x / sw * S.width, hy = (1 - shd.y / sh) * S.height;
         CGFloat bh = fabs(fy - hy), bw = bh * 0.7, x = (fx + hx) / 2 - bw / 2, y = MIN(fy, hy);
-        float hp = getHP(p); UIColor *col = hp > 50 ? UIColor.greenColor : (hp > 25 ? UIColor.yellowColor : UIColor.redColor);
-        CGContextSetStrokeColorWithColor(c, col.CGColor); CGContextSetLineWidth(c, 1.5);
-        CGContextStrokeRect(c, CGRectMake(x, y, bw, bh));
-        NSString *t = [NSString stringWithFormat:@"%@  %d", nickOf(p), (int)hp];
-        [t drawAtPoint:CGPointMake(x, y - 13) withAttributes:@{NSFontAttributeName: [UIFont boldSystemFontOfSize:10], NSForegroundColorAttributeName: UIColor.whiteColor}];
+        if (bh < 4) continue;
+        CGRect box = CGRectMake(x, y, bw, bh); float hp = fmaxf(0, fminf(100, getHP(p)));
+        // подложка, чтобы чёрный конец градиента был виден на тёмном фоне
+        CGContextSetStrokeColorWithColor(c, [UIColor colorWithWhite:0.22 alpha:0.7].CGColor); CGContextSetLineWidth(c, 3.5); CGContextStrokeRect(c, box);
+        // рамка с градиентом: снизу чёрный -> сверху белый
+        CGContextSaveGState(c); CGContextSetLineWidth(c, 1.5); CGContextAddRect(c, box); CGContextReplacePathWithStrokedPath(c); CGContextClip(c);
+        CGContextDrawLinearGradient(c, bwGrad(), CGPointMake(0, y + bh), CGPointMake(0, y), 0); CGContextRestoreGState(c);
+        // хп-бар слева: чёрный снизу, белый сверху
+        CGFloat bx = x - 7, bwid = 3, fh = bh * hp / 100.f;
+        CGContextSetFillColorWithColor(c, [UIColor colorWithWhite:0.10 alpha:0.85].CGColor); CGContextFillRect(c, CGRectMake(bx - 1, y - 1, bwid + 2, bh + 2));
+        CGContextSaveGState(c); CGContextClipToRect(c, CGRectMake(bx, y + bh - fh, bwid, fh));
+        CGContextDrawLinearGradient(c, bwGrad(), CGPointMake(0, y + bh), CGPointMake(0, y), 0); CGContextRestoreGState(c);
+        CGContextSetStrokeColorWithColor(c, [UIColor colorWithWhite:0.32 alpha:1].CGColor); CGContextSetLineWidth(c, 1);
+        CGContextStrokeRect(c, CGRectMake(bx - 0.5, y - 0.5, bwid + 1, bh + 1));
+        // текст: хп у уровня бара, ник над боксом
+        NSString *hs = [NSString stringWithFormat:@"%d", (int)hp];
+        CGFloat hy2 = fmaxf(y - 2, fminf(y + bh - 9, y + bh - fh - 4));
+        pxText(c, hs, bx - 4 - pxWidth(hs, 1.5), hy2, 1.5, 1);
+        NSString *nk = nickOf(p); if (nk.length > 14) nk = [nk substringToIndex:14];
+        pxText(c, nk, x + bw / 2 - pxWidth(nk, 1.5) / 2, y - 13, 1.5, 1);
     }
     bc("idle");
 }
@@ -439,7 +576,11 @@ static UIFont *gsF(CGFloat s);
 
 // ---------------- меню (стиль gamesense, чёрно-белое) ----------------
 #define GSC(v) [UIColor colorWithWhite:(v) / 255.0 alpha:1]
-static UIFont *gsF(CGFloat s) { UIFont *f = [UIFont fontWithName:@"Verdana" size:s]; return f ?: [UIFont systemFontOfSize:s]; }
+static UIFont *gsF(CGFloat s) {
+    static NSMutableDictionary<NSNumber *, UIFont *> *cache; if (!cache) cache = [NSMutableDictionary new];
+    UIFont *f = cache[@(s)]; if (f) return f;
+    f = [UIFont fontWithName:@"Verdana" size:s] ?: [UIFont systemFontOfSize:s]; cache[@(s)] = f; return f;
+}
 
 @interface GSCheck : UIView
 @property (nonatomic) bool *p; @property (nonatomic, copy) NSString *title;
@@ -610,7 +751,7 @@ static CGFloat gsFit(UIView *g, CGFloat y) {
 
 static void buildUI() {
     UIWindow *w = keyWin(); if (!w) return; g_h = [MenuH new];
-    g_esp = [[ESPView alloc] initWithFrame:w.bounds]; g_esp.userInteractionEnabled = NO;
+    g_esp = [[ESPView alloc] initWithFrame:w.bounds]; g_esp.userInteractionEnabled = NO; g_esp.layer.drawsAsynchronously = YES;
     g_esp.backgroundColor = UIColor.clearColor; g_esp.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     [w addSubview:g_esp];
     CADisplayLink *dl = [CADisplayLink displayLinkWithTarget:g_esp selector:@selector(setNeedsDisplay)]; [dl addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
@@ -667,10 +808,6 @@ static void buildUI() {
         g = gsGroup(pg, @"world", ny, CW); y = 14;
         y = gsCheck(g, y, "Black fog", &C.fog);
         y = gsCheck(g, y, "Black sky", &C.sky);
-        CGFloat ny2 = gsFit(g, y);
-        g = gsGroup(pg, @"own model", ny2, CW); y = 14;
-        y = gsCheck(g, y, "Spin own model (camera stays)", &C.selfSpin);
-        y = gsSlider(g, y, "Own spin speed", &C.selfSpeed, 30, 1080, 10, @"%.0f°/s");
         gsFit(g, y);
     }
     { // MISC
@@ -682,6 +819,7 @@ static void buildUI() {
         y = gsCheck(g, y, "Hitsound", &C.hitsnd);
         y = gsCheck(g, y, "Killsound", &C.killsnd);
         y = gsCheck(g, y, "Kill message", &C.killmsg);
+        y = gsCheck(g, y, "Kill sparks", &C.sparks);
         gsFit(g, y);
     }
     { // DEBUG
@@ -803,7 +941,6 @@ static void installPatches() {
     patchMI("CM.Start",   il_class_get_method(cm, "Start", 0),     RVA_CM_Start,     (void *)h_Start);      report();
     patchMI("CM.Destroy", il_class_get_method(cm, "OnDestroy", 0), RVA_CM_OnDestroy, (void *)h_Destroy);    report();
     patchMI("CM.Update",  il_class_get_method(cm, "Update", 0),    RVA_CM_Update,    (void *)h_Update);     report();
-    g_hasLate = patchMI("CM.Late", il_class_get_method(cm, "LateUpdate", 0), 0, (void *)h_Late); report();
     patchVT("DR.Damage",  dr, il_class_get_method(dr, "Damage", 2), RVA_DR_Damage,   (void *)h_Damage);     report();
     patchVT("CM.Serialize", cm, il_class_get_method(cm, "OnPhotonSerializeView", 2), RVA_CM_Serialize, (void *)h_Ser); report();
     { void *ps = findClassAny("PhotonStream"); patchMI("PS.SendNext", ps ? il_class_get_method(ps, "SendNext", 1) : NULL, RVA_PS_SendNext, (void *)h_SendNext); report(); }
@@ -855,41 +992,10 @@ static Quat w_glr(void *t) { return ((Quat (*)(void *, void *))m_glrot.fn)(t, m_
 static void w_slr(void *t, Quat q) { ((void (*)(void *, Quat, void *))m_slrot.fn)(t, q, m_slrot.mi); }
 static NSString *objName(void *o) { return (m_name.fn && o) ? il2cppStr(((void *(*)(void *, void *))m_name.fn)(o, m_name.mi)) : @"?"; }
 
-// ---------- вращение своей модели (камера не трогается) ----------
-static bool g_ssActive; static void *g_ssRoot; static void *g_ssKid[16]; static Quat g_ssBase[16]; static int g_ssN;
-static double g_ssT; static float g_ssYaw;
+// ---------- хелперы иерархии (для debug dump) ----------
 static bool ssApiOK() { return m_childCnt.fn && m_getChild.fn && m_glrot.fn && m_slrot.fn && m_parent.fn && Comp_get_tr; }
 static bool ssHasCam(void *c, void *camTr) {   // камера лежит внутри этого трансформа?
     void *t = camTr; for (int d = 0; d < 16 && t; d++) { if (t == c) return true; t = w_parent(t); } return false;
-}
-static void ssRestore() {
-    for (int i = 0; i < g_ssN; i++) if (g_ssKid[i]) w_slr(g_ssKid[i], g_ssBase[i]);
-    g_ssActive = false; g_ssN = 0; g_ssRoot = NULL;
-}
-static void applySelfSpin(void *root) {
-    if (!ssApiOK()) return;
-    if (!C.selfSpin) { if (g_ssActive) ssRestore(); g_ssT = 0; return; }
-    void *rt = Comp_get_tr(root); if (!rt) return;
-    double now = CACurrentMediaTime(); float dt = g_ssT > 0 ? (float)(now - g_ssT) : 0; g_ssT = now; if (dt > 0.1f) dt = 0.1f;
-    g_ssYaw = fmodf(g_ssYaw + C.selfSpeed * dt, 360.f);
-    int n = w_childCnt(rt); if (n > 16) n = 16; if (n <= 0) return;
-    if (g_ssRoot != rt || g_ssN != n) {   // (пере)захват базовых поворотов, уже известные не перезаписываем
-        void *nk[16]; Quat nb[16];
-        for (int i = 0; i < n; i++) {
-            void *c = w_getChild(rt, i); nk[i] = c; nb[i] = c ? w_glr(c) : (Quat){0, 0, 0, 1};
-            if (g_ssRoot == rt) for (int j = 0; j < g_ssN; j++) if (g_ssKid[j] == c) nb[i] = g_ssBase[j];
-        }
-        memcpy(g_ssKid, nk, sizeof(void *) * n); memcpy(g_ssBase, nb, sizeof(Quat) * n); g_ssN = n; g_ssRoot = rt;
-    }
-    void *cam = pickCamera(); void *camTr = cam ? Comp_get_tr(cam) : NULL;
-    float ya = g_ssYaw * (float)M_PI / 180.f, pa = C.aaPitch * (float)M_PI / 180.f;
-    Quat qy = {0, sinf(ya / 2), 0, cosf(ya / 2)}, qx = {sinf(pa / 2), 0, 0, cosf(pa / 2)};
-    for (int i = 0; i < n; i++) {
-        void *c = g_ssKid[i]; if (!c) continue;
-        if (camTr && ssHasCam(c, camTr)) continue;   // ветку с камерой не крутим
-        w_slr(c, qmul(qy, qmul(g_ssBase[i], qx)));
-    }
-    g_ssActive = true;
 }
 static void dumpHierarchy() {
     [g_snText setString:@""];
