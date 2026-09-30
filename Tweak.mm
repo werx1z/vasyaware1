@@ -40,6 +40,8 @@ static struct {
     float fogC[3] = {0, 0, 0}, skyC[3] = {0, 0, 0};   // HSV, по умолчанию чёрный
     // цвета ESP (HSV 0..1): верх / низ градиента, по умолчанию белый сверху -> чёрный снизу
     float boxTop[3] = {0, 0, 1}, boxBot[3] = {0, 0, 0}, barTop[3] = {0, 0, 1}, barBot[3] = {0, 0, 0};
+    bool  aspectOn  = false;  // растянутое разрешение
+    float aspect    = 1.33f;  // пропорция камеры (4:3 = 1.33)
     bool  hpbar     = true;   // хп-бар у ESP
     bool  glow      = true;   // свечение вокруг ESP-рамки
     bool  sparks    = true;   // искры при убийстве
@@ -130,6 +132,7 @@ static void (*Cam_w2s)(void *, Vec3 *, int, Vec3 *);
 static int (*Scr_w)(void), (*Scr_h)(void);
 static void (*RS_fog)(bool), (*RS_fogMode)(int), (*RS_fogDens)(float), (*RS_fogCol)(Col *), (*RS_skybox)(void *);
 static void (*Cam_clear)(void *, int), (*Cam_bg)(void *, Col *);
+static void (*Cam_setAsp)(void *, float), (*Cam_resetAsp)(void *);
 
 static NSString *il2cppStr(void *s) {
     if (!s) return @"";
@@ -260,6 +263,12 @@ static void applyVisuals() {
     }
 }
 
+static bool g_aspOn;
+static void applyAspect() {   // растянутое разрешение: подменяем aspect основной камеры, при выключении возвращаем
+    if (!Cam_setAsp) return;
+    if (C.aspectOn) { void *cam = pickCamera(); if (cam) { Cam_setAsp(cam, fmaxf(0.5f, C.aspect)); g_aspOn = true; } }
+    else if (g_aspOn) { void *cam = pickCamera(); if (cam && Cam_resetAsp) Cam_resetAsp(cam); g_aspOn = false; }
+}
 static float g_baseSpeed, g_lastShoot; static int g_lastFrags = -1; static double g_dtT; static int g_dtLog;
 static void h_Update(void *self, void *mi) {
     fn_v_t o = (fn_v_t)origOf(mi); if (o) o(self, mi);
@@ -301,12 +310,12 @@ static void h_Update(void *self, void *mi) {
         *sp = g_baseSpeed * C.bhopMul;
         if (FN(RVA_CM_IsGrounded, bool, void *, void *)(self, NULL)) FN(RVA_CM_Jump, void, void *, void *)(self, NULL);
     } else if (g_baseSpeed != 0) { *(float *)((uintptr_t)self + OFF_CM_Speed) = g_baseSpeed; }
-    if (!g_hasLate) applyOwnAA(self);
+    if (!g_hasLate) { applyOwnAA(self); applyAspect(); }
 }
 
 static void h_Late(void *self, void *mi) {
     fn_v_t o = (fn_v_t)origOf(mi); if (o) o(self, mi);
-    if (self == g_local) applyOwnAA(self);
+    if (self == g_local) { applyOwnAA(self); applyAspect(); }
 }
 
 // silent aim на самой пуле (Update у BaseBulletScript и подклассов)
@@ -520,7 +529,7 @@ static CGGradientRef bwGrad() {   // 0 = чёрный, 1 = белый
         CGFloat hx = shd.x / sw * S.width, hy = (1 - shd.y / sh) * S.height;
         CGFloat bh = fabs(fy - hy), bw = bh * 0.7, x = (fx + hx) / 2 - bw / 2, y = MIN(fy, hy);
         if (bh < 4) continue;
-        { CGFloat mid = y + bh / 2; bh *= 1.15; bw = bh * 0.75; x = (fx + hx) / 2 - bw / 2; y = mid - bh / 2; }   // рамка чуть крупнее
+        { CGFloat mid = y + bh / 2; bh *= 1.15; bw = bh * 0.75 * ((C.aspectOn && C.aspect > 0.1f) ? (sw / sh) / C.aspect : 1.f); x = (fx + hx) / 2 - bw / 2; y = mid - bh / 2; }   // рамка чуть крупнее
         CGRect box = CGRectMake(x, y, bw, bh); float hp = fmaxf(0, fminf(100, getHP(p)));
         if (C.glow) {   // мягкое белое свечение: несколько расширяющихся полупрозрачных обводок с аддитивным смешиванием
             CGPathRef gp = CGPathCreateWithRoundedRect(box, 3, 3, NULL);
@@ -865,6 +874,8 @@ static void buildUI() {
         g = gsGroup(pg, @"world", ny, CW); y = 14;
         y0 = y; y = gsCheck(g, y, "Fog", &C.fog); gsSwatch(g, pg, y0, "Fog", C.fogC, NULL);
         y0 = y; y = gsCheck(g, y, "Sky", &C.sky); gsSwatch(g, pg, y0, "Sky", C.skyC, NULL);
+        y = gsCheck(g, y, "Aspect ratio (stretched)", &C.aspectOn);
+        y = gsSlider(g, y, "Aspect", &C.aspect, 1.0f, 2.4f, 0.01f, @"%.2f");
         gsFit(g, y);
     }
     { // MISC
@@ -1020,7 +1031,7 @@ static void installPatches() {
 static void *coreImg, *camKlass;
 static void *(*il_array_new)(void *, uintptr_t);
 struct MM { void *fn, *mi; };
-static MM m_gtr, m_gpos, m_grot, m_srot, m_look, m_w2s, m_main, m_sw, m_sh, m_fog, m_fogMode, m_fogDens, m_fogCol, m_sky, m_clear, m_bg, m_allCnt, m_getAll, m_enabled, m_targetTex, m_childCnt, m_getChild, m_parent, m_name, m_glrot, m_slrot;
+static MM m_gtr, m_gpos, m_grot, m_srot, m_look, m_w2s, m_main, m_sw, m_sh, m_fog, m_fogMode, m_fogDens, m_fogCol, m_sky, m_clear, m_bg, m_allCnt, m_getAll, m_enabled, m_targetTex, m_childCnt, m_getChild, m_parent, m_name, m_glrot, m_slrot, m_setAsp, m_resetAsp;
 static bool mgd(const char *ns, const char *cls, const char *meth, int argc, MM *out) {
     if (!coreImg) return false;
     void *k = il_class_from_name(coreImg, ns, cls); if (!k) return false;
@@ -1042,6 +1053,8 @@ static void w_fogDens(float d) { ((void (*)(float, void *))m_fogDens.fn)(d, m_fo
 static void w_fogCol(Col *c) { ((void (*)(Col, void *))m_fogCol.fn)(*c, m_fogCol.mi); }
 static void w_sky(void *m) { ((void (*)(void *, void *))m_sky.fn)(m, m_sky.mi); }
 static void w_clear(void *cam, int f) { ((void (*)(void *, int, void *))m_clear.fn)(cam, f, m_clear.mi); }
+static void w_setAsp(void *cam, float a) { ((void (*)(void *, float, void *))m_setAsp.fn)(cam, a, m_setAsp.mi); }
+static void w_resetAsp(void *cam) { ((void (*)(void *, void *))m_resetAsp.fn)(cam, m_resetAsp.mi); }
 static void w_bg(void *cam, Col *c) { ((void (*)(void *, Col, void *))m_bg.fn)(cam, *c, m_bg.mi); }
 
 static int w_childCnt(void *t) { return ((int (*)(void *, void *))m_childCnt.fn)(t, m_childCnt.mi); }
@@ -1162,6 +1175,8 @@ static void setup() {
     API(RS_skybox,   w_sky,    m_sky,     "UnityEngine", "RenderSettings", "set_skybox", 1, "UnityEngine.RenderSettings::set_skybox(UnityEngine.Material)", "sky");
     API(Cam_clear,   w_clear,  m_clear,   "UnityEngine", "Camera",         "set_clearFlags", 1, "UnityEngine.Camera::set_clearFlags(UnityEngine.CameraClearFlags)", "clr");
     API(Cam_bg,      w_bg,     m_bg,      "UnityEngine", "Camera",         "set_backgroundColor", 1, "UnityEngine.Camera::set_backgroundColor_Injected(UnityEngine.Color&)", "bg");
+    API(Cam_setAsp,  w_setAsp, m_setAsp,  "UnityEngine", "Camera",         "set_aspect", 1, "UnityEngine.Camera::set_aspect(System.Single)", "asp");
+    API(Cam_resetAsp,w_resetAsp,m_resetAsp,"UnityEngine","Camera",         "ResetAspect", 0, "UnityEngine.Camera::ResetAspect()", "rasp");
     mgd("UnityEngine", "Camera", "get_allCamerasCount", 0, &m_allCnt);
     mgd("UnityEngine", "Camera", "GetAllCameras", 1, &m_getAll);
     mgd("UnityEngine", "Behaviour", "get_enabled", 0, &m_enabled);
