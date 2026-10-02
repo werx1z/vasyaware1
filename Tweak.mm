@@ -1,1442 +1,1221 @@
-// ChickenMenu - HvH для закрытого лобби. Все офсеты из dump.cs ТВОЕЙ версии игры.
 #import <UIKit/UIKit.h>
-#import <AudioToolbox/AudioToolbox.h>
 #import <AVFoundation/AVFoundation.h>
-#include "sounds.h"   // hit_wav (fatality), kill_wav (odin svinya)
-#include <mach-o/dyld.h>
-#include <dlfcn.h>
-#include <math.h>
+#include "sounds.h"
+#import <QuartzCore/QuartzCore.h>
+static void Log(NSString* s);
+
+// ===== Звуки + конфиг =====
+
+// Sounds.h - хитсаунды (fatality / neverlose / skeet) и киллсаунд (odin), вшитые в dylib
+#import <Foundation/Foundation.h>
+#import <AVFoundation/AVFoundation.h>
+
+
+// ---------- конфиг ----------
+// Хранится в NSMutableDictionary -> легко сохранять/загружать как JSON.
+// Цвет: @[r,g,b,a] (0..1). Режим градиента: key.mode (0 solid, 1 gradient), цвета key.c1 / key.c2
+@interface Cfg : NSObject
++ (NSMutableDictionary*)d;
++ (BOOL)b:(NSString*)k;
++ (float)f:(NSString*)k;
++ (int)i:(NSString*)k;
++ (void)set:(id)v for:(NSString*)k;
++ (NSArray<NSNumber*>*)rgba:(NSString*)k;      // для ESP-рендера
++ (NSString*)dir;
++ (NSArray<NSString*>*)list;
++ (BOOL)save:(NSString*)name;
++ (BOOL)load:(NSString*)name;
+@end
+
+@implementation Cfg
++ (NSMutableDictionary*)d { static NSMutableDictionary* x; static dispatch_once_t o; dispatch_once(&o, ^{ x = [NSMutableDictionary new]; }); return x; }
++ (BOOL)b:(NSString*)k { @synchronized(self.d) { return [[self d][k] boolValue]; } }
++ (float)f:(NSString*)k { @synchronized(self.d) { return [[self d][k] floatValue]; } }
++ (int)i:(NSString*)k { @synchronized(self.d) { return [[self d][k] intValue]; } }
++ (void)set:(id)v for:(NSString*)k { @synchronized(self.d) { self.d[k] = v; } }
++ (NSArray<NSNumber*>*)rgba:(NSString*)k { return [self d][k] ?: @[@1,@1,@1,@1]; }
++ (NSString*)dir {
+    NSString* p = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject stringByAppendingPathComponent:@"Configs"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:p withIntermediateDirectories:YES attributes:nil error:nil];
+    return p;
+}
++ (NSArray<NSString*>*)list {
+    NSMutableArray* r = [NSMutableArray new];
+    for (NSString* f in [[NSFileManager defaultManager] contentsOfDirectoryAtPath:[self dir] error:nil])
+        if ([f.pathExtension isEqualToString:@"json"]) [r addObject:f.stringByDeletingPathExtension];
+    return r;
+}
++ (BOOL)save:(NSString*)name {
+    NSData* j = [NSJSONSerialization dataWithJSONObject:[self d] options:NSJSONWritingPrettyPrinted error:nil];
+    return j && [j writeToFile:[[self dir] stringByAppendingPathComponent:[name stringByAppendingString:@".json"]] atomically:YES];
+}
++ (BOOL)load:(NSString*)name {
+    NSData* j = [NSData dataWithContentsOfFile:[[self dir] stringByAppendingPathComponent:[name stringByAppendingString:@".json"]]];
+    id o = j ? [NSJSONSerialization JSONObjectWithData:j options:0 error:nil] : nil;
+    if (![o isKindOfClass:NSDictionary.class]) return NO;
+    [[self d] addEntriesFromDictionary:o];
+    return YES;
+}
+@end
+
+// ---------- звуки ----------
+namespace Snd {
+inline NSArray<NSString*>* HitNames() { return @[@"Fatality", @"Neverlose", @"Skeet"]; }
+
+inline AVAudioPlayer* Make(const unsigned char* d, size_t n) {
+    NSData* data = [NSData dataWithBytes:d length:n];
+    AVAudioPlayer* p = [[AVAudioPlayer alloc] initWithData:data error:nil];
+    [p prepareToPlay];
+    return p;
+}
+inline void Play(AVAudioPlayer* p, float vol) {
+    if (!p) return;
+    p.volume = vol;
+    p.currentTime = 0;
+    [p play];
+}
+inline void PlayHit(int idx) {
+    static AVAudioPlayer* pl[3];
+    static dispatch_once_t o;
+    dispatch_once(&o, ^{
+        pl[0] = Make(snd_fatality, snd_fatality_len);
+        pl[1] = Make(snd_neverlose, snd_neverlose_len);
+        pl[2] = Make(snd_skeet, snd_skeet_len);
+    });
+    if (idx < 0 || idx > 2) idx = 0;
+    Play(pl[idx], [Cfg f:@"snd.volume"]);
+}
+inline void PlayKill() {
+    static AVAudioPlayer* p; static dispatch_once_t o;
+    dispatch_once(&o, ^{ p = Make(snd_odin, snd_odin_len); });
+    Play(p, [Cfg f:@"snd.volume"]);
+}
+// вызывать из хуков: Hit -> OnHit(), DieViaServer (когда убил ты) -> OnKill()
+inline void OnHit()  { if ([Cfg b:@"hitsound"])  dispatch_async(dispatch_get_main_queue(), ^{ PlayHit([Cfg i:@"hitsound.idx"]); }); }
+inline void OnKill() { if ([Cfg b:@"killsound"]) dispatch_async(dispatch_get_main_queue(), ^{ PlayKill(); }); }
+}
+
+// ===== Доступ к игре =====
+// Оффсеты из дампа. (?) = догадка, проверить в игре.
+#include <cstdint>
+#include <cstring>
+#include <vector>
+#include <unordered_map>
 #include <initializer_list>
-#include <string.h>
-#include <stdint.h>
-#include <ctype.h>
-#include <string.h>
 #include <math.h>
-#include <stddef.h>
-#include <fcntl.h>
-#include <unistd.h>
+#include <dlfcn.h>
+#include <mach/mach.h>
+#include <mach-o/dyld.h>
 
 struct Vec3 { float x, y, z; };
-struct Quat { float x, y, z, w; };
-struct Col  { float r, g, b, a; };
-static Col hsvCol(const float *c) {   // h,s,v в 0..1 -> RGB
-    float h = c[0] * 6.f, s = c[1], v = c[2], fl = floorf(h), f = h - fl; int i = (int)fl % 6;
-    float p = v * (1 - s), q = v * (1 - s * f), t = v * (1 - s * (1 - f)); Col o = {0, 0, 0, 1};
-    switch (i) { case 0: o.r = v; o.g = t; o.b = p; break; case 1: o.r = q; o.g = v; o.b = p; break; case 2: o.r = p; o.g = v; o.b = t; break;
-                 case 3: o.r = p; o.g = q; o.b = v; break; case 4: o.r = t; o.g = p; o.b = v; break; default: o.r = v; o.g = p; o.b = q; break; }
-    return o;
+struct Col4 { float r, g, b, a; };
+
+namespace OFF {
+    // PlayerController
+    constexpr uintptr_t PC_Team = 0x49, PC_Biped = 0x30, PC_Movement = 0x68, PC_Weaponry = 0x58,
+        PC_PhotonPlayer = 0x120, PC_HpA = 0x118, PC_HpB = 0x11C;       // (?) какой из двух HP
+    constexpr uintptr_t PMC_Camera = 0x18, PMC_Transform = 0x30, PMC_Player = 0x40;   // PlayerMainCamera
+    constexpr uintptr_t RVA_PMC_GetInstance = 0x1AB1E48;                             // static
+    constexpr uintptr_t PP_Nick = 0x18;                                              // PhotonPlayer.nameField
+    constexpr uintptr_t WC_Current = 0x90;                                           // (?) WeaponryController -> текущее оружие
+    constexpr uintptr_t RVA_WeaponId = 0x1918F58;                                    // (?) WeaponController.NGBBPDDCMAC -> DFBFMIHOHPG
+    constexpr uintptr_t HC_Player = 0x78;                                            // HitController -> PlayerController (жертва)
+    constexpr uintptr_t MC_Input = 0x70, MC_CharCtrl = 0x80;                         // MovementController
+    constexpr uintptr_t PC_Aim = 0x50, AC_Fps = 0x70, AC_Cam = 0x80, AC_AimData = 0x90;   // PlayerController -> AimController: FPSCamera/camTransform/aimingData
+    constexpr uintptr_t WPN_Owner = 0x18;                                            // WeaponController -> PlayerController
+    constexpr uintptr_t MI_Move = 0x10, MI_Jump = 0x24;                              // (?) MLGFJPPLONI: вектор движения, флаг прыжка
+    constexpr uintptr_t RVA_MC_Speed = 0x1AAA3DC;                                    // (?) MovementController.AJDCAMCKEMB(float)
 }
 
-// ---------------- настройки ----------------
-static struct {
-    bool fog = true, sky = true, hitm = true, hitsnd = true, killsnd = true, esp = true;
-    bool silent = true, nospread = true, dtap = true, bhop = true, aa = false;
-    float bhopMul = 1.25f;   // множитель SpeedValue
-    float aaOff   = 60.f;    // диапазон джиттера +- (градусы)
-    float aaBase  = 0.f;     // базовый поворот по yaw
-    float aaSpin  = 40.f;    // градусов за тик отправки (режим Spin)
-    float aaPitch = 90.f;    // наклон модели: 90 = смотрит вниз, -90 = вверх
-    int   aaMode  = 1;       // 0 jitter, 1 spin, 2 static, 3 random
-    bool  killmsg   = true;   // плашка "killed <ник>" сверху
-    float fogC[3] = {0, 0, 0}, skyC[3] = {0, 0, 0};   // HSV, по умолчанию чёрный
-    // цвета ESP (HSV 0..1): верх / низ градиента, по умолчанию белый сверху -> чёрный снизу
-    float boxTop[3] = {0, 0, 1}, boxBot[3] = {0, 0, 0}, barTop[3] = {0, 0, 1}, barBot[3] = {0, 0, 0};
-    bool  aspectOn  = false;  // растянутое разрешение
-    float aspect    = 1.33f;  // пропорция камеры (4:3 = 1.33)
-    bool  dist      = true;   // дистанция под ESP
-    bool  lines     = true;   // линии от низа экрана к ногам врагов
-    int   lineOrg   = 0;      // старт линий: 0 низ, 1 центр, 2 верх
-    float lineW     = 1.0f;   // толщина линий (pt)
-    float lineC[3]  = {0, 0, 1};   // цвет линий (HSV), по умолчанию белый
-    bool  corner    = false;  // угловые рамки вместо цельной
-    float cnTop[3]  = {0, 0, 1}, cnBot[3] = {0.58f, 0.8f, 1};   // градиент угловых рамок (HSV): верх / низ
-    bool  weapon    = true;   // иконка оружия справа от рамки
-    bool  arrows    = true;   // стрелки к врагам вне экрана
-    float arrC[3]   = {0, 0, 1};   // цвет стрелок
-    float arrSize   = 10.f;   // размер стрелок
-    bool  xhair     = false;  // свой прицел
-    int   xhShape   = 0;      // 0 крест, 1 точка, 2 круг, 3 квадрат, 4 X, 5 ромб
-    float xhC[3]    = {0.33f, 1, 1};   // цвет прицела
-    float xhSize = 8.f, xhThick = 1.f, xhGap = 3.f;
-    bool  tracers   = true;   // трассеры своих пуль
-    float trC[3]    = {0.55f, 0.6f, 1};   // цвет трассеров
-    float trW       = 0.7f;   // толщина ядра трассера
-    bool  hpbar     = true;   // хп-бар у ESP
-    bool  glow      = true;   // свечение вокруг ESP-рамки
-    bool  sparks    = true;   // искры при убийстве
-    bool  ownAA     = true;   // видеть свой антиаим на своей модели (камера остаётся)
-    float headH   = 0.9f;    // высота головы над ногами (умножается на масштаб)
-} C;
+namespace G {
+inline uintptr_t base = 0;
+inline bool inited = false;
+inline char status[300] = "init";
 
-// ---------------- офсеты ----------------
-#define RVA_CM_Start        0x3D84098
-#define RVA_CM_OnDestroy    0x3D8AC44
-#define RVA_CM_Update       0x3D85350
-#define RVA_CM_get_HP       0x3D8B7D0
-#define RVA_CM_IsAlive     0x3D7AE6C
-#define RVA_CM_ViewID       0x3D8B9CC
-#define RVA_CM_IsGrounded   0x3D89C50
-#define RVA_CM_Jump         0x3D8A73C
-#define RVA_CM_PushBullet   0x3D77000
-#define RVA_CM_MakeKill     0x3D8BACC
-#define RVA_CM_Serialize    0x3D88214
-#define RVA_DR_Damage       0x3D8DA38
-#define RVA_MBP_photonView  0x5D89D44
-#define RVA_PS_SendNext     0x5D836FC
-#define RVA_BB_UpdatePos    0x3DC025C
-
-#define OFF_CM_Speed   0x4C
-#define OFF_CM_Team    0xF4
-#define OFF_CM_PWM     0xB8
-#define OFF_CM_Scale   0x168
-#define OFF_CM_Frags   0x5C
-#define OFF_CM_LastShoot 0x22C
-#define OFF_PWM_Weapon 0x30
-#define OFF_PWM_Target 0x48
-#define OFF_W_Ammo     0x7C
-#define OFF_W_GunInfo  0x100
-#define OFF_GI_ErrDelta 0x38
-#define OFF_GI_Params   0x30
-#define OFF_PV_IsMine  0x68
-#define OFF_PV_Owner   0x80
-#define OFF_PL_Nick    0x20
-#define OFF_PS_Writing 0x24
-#define OFF_BUL_Owner  0x34
-#define OFF_BUL_Orig   0x45
-#define OFF_BUL_Life   0x50
-#define OFF_BUL_Tr     0x58
-#define OFF_BUL_Dir    0x60
-
-// ---------------- утилиты ----------------
-static uintptr_t B;
-#define FN(rva, ret, ...) ((ret (*)(__VA_ARGS__))(B + (rva)))
-static NSMutableSet<NSNumber *> *g_players;
-static void *g_local;
-static double g_hitTime; static float g_hitDmg;
-static int g_gameFrames;   // кадры игры (для фпс в ватермарке)
-static AVAudioPlayer *g_hitP, *g_killP;
-static void initSounds() {
-    g_hitP  = [[AVAudioPlayer alloc] initWithData:[NSData dataWithBytes:hit_wav length:hit_wav_len] error:nil];
-    g_killP = [[AVAudioPlayer alloc] initWithData:[NSData dataWithBytes:kill_wav length:kill_wav_len] error:nil];
-    g_hitP.volume = 1.0; g_killP.volume = 1.0; [g_hitP prepareToPlay]; [g_killP prepareToPlay];
-}
-static dispatch_queue_t g_sndQ;
-static void playSnd(AVAudioPlayer *p) {   // не в игровом потоке: play() на нём даёт микрофриз при каждом попадании
-    if (!p) return;
-    if (!g_sndQ) g_sndQ = dispatch_queue_create("cm.snd", DISPATCH_QUEUE_SERIAL);
-    dispatch_async(g_sndQ, ^{ p.currentTime = 0; [p play]; });
-}
-
-static uintptr_t getBase(const char *name) {
+inline void Init() {
+    if (base) return;
     for (uint32_t i = 0; i < _dyld_image_count(); i++) {
-        const char *n = _dyld_get_image_name(i);
-        if (n && strstr(n, name)) return (uintptr_t)_dyld_get_image_header(i);
-    }
-    return 0;
-}
-
-// icall
-static void *(*resolve_icall)(const char *);
-static void *(*il2cpp_object_get_class)(void *);
-static const char *(*il2cpp_class_get_name)(void *);
-#define ICALL(var, name) var = (decltype(var))resolve_icall(name)
-
-static void *(*Cam_main)(void);
-static void *(*Comp_get_tr)(void *);
-static void (*Tr_get_pos)(void *, Vec3 *);
-static void (*Tr_set_rot)(void *, Quat *);
-static void (*Tr_get_rot)(void *, Quat *);
-static void (*Quat_Look)(Vec3 *, Vec3 *, Quat *);
-static void (*Cam_w2s)(void *, Vec3 *, int, Vec3 *);
-static int (*Scr_w)(void), (*Scr_h)(void);
-static void (*RS_fog)(bool), (*RS_fogMode)(int), (*RS_fogDens)(float), (*RS_fogCol)(Col *), (*RS_skybox)(void *);
-static void (*Cam_clear)(void *, int), (*Cam_bg)(void *, Col *);
-static void (*Cam_setAsp)(void *, float), (*Cam_resetAsp)(void *);
-
-static NSString *il2cppStr(void *s) {
-    if (!s) return @"";
-    int len = *(int *)((uintptr_t)s + 0x10);
-    if (len <= 0 || len > 64) return @"";
-    return [NSString stringWithCharacters:(unichar *)((uintptr_t)s + 0x14) length:len];
-}
-
-static void *pvOf(void *p)  { return FN(RVA_MBP_photonView, void *, void *, void *)(p, NULL); }
-static bool isMine(void *p) { void *pv = pvOf(p); return pv && *(bool *)((uintptr_t)pv + OFF_PV_IsMine); }
-static float getHP(void *p) { return FN(RVA_CM_get_HP, float, void *, void *)(p, NULL); }
-static bool alive(void *p)  { return FN(RVA_CM_IsAlive, bool, void *, void *)(p, NULL); }
-static int viewID(void *p)  { return FN(RVA_CM_ViewID, int, void *, void *)(p, NULL); }
-static NSString *nickOf(void *p) {
-    void *pv = pvOf(p); void *ow = pv ? *(void **)((uintptr_t)pv + OFF_PV_Owner) : NULL;
-    return ow ? il2cppStr(*(void **)((uintptr_t)ow + OFF_PL_Nick)) : @"?";
-}
-static Vec3 posOf(void *o) {
-    Vec3 v = {0, 0, 0}; void *t = Comp_get_tr ? Comp_get_tr(o) : NULL;
-    if (t && Tr_get_pos) Tr_get_pos(t, &v); return v;
-}
-static float scaleOf(void *p) { float s = *(float *)((uintptr_t)p + OFF_CM_Scale); return (s > 0.01f && s < 20.f) ? s : 1.f; }
-
-// ---------------- цель ----------------
-static Vec3 g_aim; static bool g_hasTarget;
-static void updateTarget() {
-    g_hasTarget = false; if (!g_local) return;
-    Vec3 me = posOf(g_local); int myTeam = *(int *)((uintptr_t)g_local + OFF_CM_Team);
-    float best = 1e18f; NSArray *all; @synchronized (g_players) { all = g_players.allObjects; }
-    for (NSNumber *n in all) {
-        void *p = (void *)n.unsignedLongValue; if (p == g_local || !alive(p)) continue;
-        if (myTeam != 0 && *(int *)((uintptr_t)p + OFF_CM_Team) == myTeam) continue; // проверь значение "без команды"
-        Vec3 q = posOf(p); float dx = q.x - me.x, dy = q.y - me.y, dz = q.z - me.z, d = dx*dx + dy*dy + dz*dz;
-        if (d < best) { best = d; g_aim = (Vec3){q.x, q.y + C.headH * scaleOf(p), q.z}; g_hasTarget = true; }
+        const char* n = _dyld_get_image_name(i);
+        if (n && strstr(n, "UnityFramework")) { base = (uintptr_t)_dyld_get_image_header(i); break; }
     }
 }
-
-// ---------------- хлебные крошки (место падения) ----------------
-static int g_bcFd = -1;
-static void bc(const char *s) {
-    if (g_bcFd < 0) return;
-    char b[40]; memset(b, ' ', sizeof b); size_t n = strlen(s); if (n > 38) n = 38;
-    memcpy(b, s, n); b[39] = '\n'; pwrite(g_bcFd, b, sizeof b, 0);
+inline bool Valid(uintptr_t p) { return p > 0x100000000ULL && p < 0x1000000000ULL; }
+// чтение через vm_read: висячий указатель не роняет игру
+inline bool RdBytes(uintptr_t a, void* out, size_t n) {
+    if (!Valid(a)) return false;
+    vm_size_t sz = 0;
+    return vm_read_overwrite(mach_task_self(), (vm_address_t)a, n, (vm_address_t)out, &sz) == KERN_SUCCESS && sz == n;
 }
-static void *pickCamera();
-static void applyOwnAA(void *root);
-static void dumpHierarchy();
-static bool g_hasLate;
-
-// ---------------- таблица оригинальных указателей ----------------
-struct OrigE { void *mi; void *fn; };
-static OrigE g_orig[128]; static int g_nOrig;
-static void regOrig(void *mi, void *fn) { if (g_nOrig < 128) g_orig[g_nOrig++] = (OrigE){mi, fn}; }
-static void *origOf(void *mi) { for (int i = 0; i < g_nOrig; i++) if (g_orig[i].mi == mi) return g_orig[i].fn; return NULL; }
-typedef void (*fn_v_t)(void *, void *);
-typedef void (*fn_dmg_t)(void *, float, int, void *);
-typedef void (*fn_ser_t)(void *, void *, void *, void *);
-
-static Quat qmul(Quat a, Quat b) {
-    return (Quat){ a.w*b.x + a.x*b.w + a.y*b.z - a.z*b.y,
-                   a.w*b.y - a.x*b.z + a.y*b.w + a.z*b.x,
-                   a.w*b.z + a.x*b.y - a.y*b.x + a.z*b.w,
-                   a.w*b.w - a.x*b.x - a.y*b.y - a.z*b.z };
+template <class T> inline T Rd(uintptr_t a) { T v{}; RdBytes(a, &v, sizeof(T)); return v; }
+inline uintptr_t Ptr(uintptr_t a) { return Rd<uintptr_t>(a); }
+template <class T> inline void Wr(uintptr_t a, T v) { if (Valid(a)) memcpy((void*)a, &v, sizeof(T)); }
+inline NSString* Str(uintptr_t s) {          // il2cpp string: длина 0x10, символы 0x14
+    if (!Valid(s)) return @"";
+    int len = Rd<int>(s + 0x10); if (len <= 0 || len > 40) return @"";
+    unichar b[48] = {0}; if (!RdBytes(s + 0x14, b, len * 2)) return @"";
+    return [NSString stringWithCharacters:b length:len];
 }
 
-// ---------------- обработчики ----------------
-// ---------------- плашка "killed <ник>" ----------------
-static NSString *g_killNick; static double g_killT;
-static double g_fragT, g_deathT; static NSString *g_deathNick; static Vec3 g_deathPos; static bool g_fragPend, g_deathFresh;
-static NSMutableDictionary<NSNumber *, NSNumber *> *g_aliveMap;
-// ---------------- искры при убийстве (мировые частицы, проецируются в 2D) ----------------
-struct Spark { Vec3 p, v; double born; float life, size; };
-static Spark g_sparks[160]; static int g_nSparks;
-static float frand(float a, float b) { return a + (float)arc4random_uniform(10001) / 10000.f * (b - a); }
-static void spawnSparks(Vec3 c) {
-    g_nSparks = 0; double now = CACurrentMediaTime();
-    for (int i = 0; i < 90 && g_nSparks < 160; i++) {
-        float th = frand(0, 2 * (float)M_PI), up = frand(-0.15f, 1.0f), r = sqrtf(fmaxf(0, 1 - up * up)), sp = frand(2.5f, 9.f);
-        g_sparks[g_nSparks++] = (Spark){ c, {cosf(th) * r * sp, up * sp * 0.9f + 1.5f, sinf(th) * r * sp}, now, frand(0.45f, 1.1f), frand(1.0f, 2.2f) };
+// ---- Unity icall'ы: пробуем несколько имён, т.к. зависят от версии Unity ----
+using ResolveFn = void* (*)(const char*);
+inline ResolveFn resolve = nullptr;
+inline void* IC(std::initializer_list<const char*> l, const char** hit = nullptr) {
+    for (auto n : l) { void* p = resolve(n); if (p) { if (hit) *hit = n; return p; } }
+    return nullptr;
+}
+inline void (*i_posInj)(void*, Vec3*) = nullptr;
+inline Vec3 (*i_posRet)(void*) = nullptr;
+inline void (*i_w2sInj)(void*, Vec3*, int, Vec3*) = nullptr;
+inline Vec3 (*i_w2sRet)(void*, Vec3, int) = nullptr;
+inline int  (*i_sw)() = nullptr;
+inline int  (*i_sh)() = nullptr;
+inline void (*i_setAspect)(void*, float) = nullptr;
+inline void (*i_resetAspect)(void*) = nullptr;
+inline void (*i_setClear)(void*, int) = nullptr;
+inline void (*i_setBg)(void*, Col4*) = nullptr;
+inline void (*i_fog)(bool) = nullptr;
+inline void (*i_fogCol)(Col4*) = nullptr;
+inline void (*i_fogMode)(int) = nullptr;
+inline void (*i_fogStart)(float) = nullptr;
+inline void (*i_fogEnd)(float) = nullptr;
+inline bool (*i_grounded)(void*) = nullptr;
+inline void (*i_getRot)(void*, float*) = nullptr;   // Transform.rotation (x,y,z,w)
+inline void (*i_setRot)(void*, float*) = nullptr;
+
+inline void InitUnity() {
+    if (inited) return;
+    resolve = (ResolveFn)dlsym(RTLD_DEFAULT, "il2cpp_resolve_icall");
+    if (!resolve) { snprintf(status, sizeof status, "il2cpp_resolve_icall not exported"); return; }
+    const char *a = 0, *b = 0;
+    i_posInj = (decltype(i_posInj))IC({"UnityEngine.Transform::get_position_Injected", "UnityEngine.Transform::INTERNAL_get_position"}, &a);
+    if (!i_posInj) i_posRet = (decltype(i_posRet))IC({"UnityEngine.Transform::get_position"}, &a);
+    i_w2sInj = (decltype(i_w2sInj))IC({"UnityEngine.Camera::WorldToScreenPoint_Injected", "UnityEngine.Camera::INTERNAL_CALL_WorldToScreenPoint"}, &b);
+    if (!i_w2sInj) i_w2sRet = (decltype(i_w2sRet))IC({"UnityEngine.Camera::WorldToScreenPoint"}, &b);
+    i_sw = (decltype(i_sw))IC({"UnityEngine.Screen::get_width"});
+    i_sh = (decltype(i_sh))IC({"UnityEngine.Screen::get_height"});
+    i_setAspect   = (decltype(i_setAspect))IC({"UnityEngine.Camera::set_aspect"});
+    i_resetAspect = (decltype(i_resetAspect))IC({"UnityEngine.Camera::ResetAspect"});
+    i_setClear    = (decltype(i_setClear))IC({"UnityEngine.Camera::set_clearFlags"});
+    i_setBg       = (decltype(i_setBg))IC({"UnityEngine.Camera::set_backgroundColor_Injected", "UnityEngine.Camera::INTERNAL_set_backgroundColor"});
+    i_fog         = (decltype(i_fog))IC({"UnityEngine.RenderSettings::set_fog"});
+    i_fogCol      = (decltype(i_fogCol))IC({"UnityEngine.RenderSettings::set_fogColor_Injected", "UnityEngine.RenderSettings::INTERNAL_set_fogColor"});
+    i_fogMode     = (decltype(i_fogMode))IC({"UnityEngine.RenderSettings::set_fogMode"});
+    i_fogStart    = (decltype(i_fogStart))IC({"UnityEngine.RenderSettings::set_fogStartDistance"});
+    i_fogEnd      = (decltype(i_fogEnd))IC({"UnityEngine.RenderSettings::set_fogEndDistance"});
+    i_grounded    = (decltype(i_grounded))IC({"UnityEngine.CharacterController::get_isGrounded"});
+    i_getRot = (decltype(i_getRot))IC({"UnityEngine.Transform::get_rotation_Injected", "UnityEngine.Transform::get_rotation_Injected(UnityEngine.Quaternion&)", "UnityEngine.Transform::INTERNAL_get_rotation"});
+    i_setRot = (decltype(i_setRot))IC({"UnityEngine.Transform::set_rotation_Injected", "UnityEngine.Transform::set_rotation_Injected(UnityEngine.Quaternion&)", "UnityEngine.Transform::INTERNAL_set_rotation"});
+    Log([NSString stringWithFormat:@"icall: rot get=%d set=%d", i_getRot != 0, i_setRot != 0]);
+    Log([NSString stringWithFormat:@"icall: pos=%s w2s=%s screen=%d aspect=%d fog=%d sky=%d grounded=%d", a ? a : "NO", b ? b : "NO",
+         i_sw && i_sh, i_setAspect != 0, i_fog && i_fogCol, i_setClear && i_setBg, i_grounded != 0]);
+    if (!(i_posInj || i_posRet) || !(i_w2sInj || i_w2sRet) || !i_sw || !i_sh) {
+        snprintf(status, sizeof status, "icall missing: pos=%s w2s=%s", a ? a : "NO", b ? b : "NO"); return;
     }
+    snprintf(status, sizeof status, "OK pos=%s w2s=%s", a, b);
+    inited = true;
 }
-static void showKill(NSString *n, const Vec3 *at) {
-    g_fragPend = false; g_deathFresh = false;
-    if (at && C.sparks) spawnSparks(*at);
-    if (!C.killmsg) return;
-    g_killNick = n.length ? n : @"?"; g_killT = CACurrentMediaTime();
+
+inline bool Pos(uintptr_t t, Vec3& o) {
+    if (!Valid(t)) return false;
+    if (i_posInj) { i_posInj((void*)t, &o); return true; }
+    if (i_posRet) { o = i_posRet((void*)t); return true; }
+    return false;
 }
-static void onFrag() {
+// r.x/r.y в пикселях Unity (начало снизу), r.z > 0 = перед камерой
+inline bool W2SRaw(uintptr_t cam, Vec3 w, Vec3& r) {
+    if (!Valid(cam)) return false;
+    if (i_w2sInj) { i_w2sInj((void*)cam, &w, 2 /*Mono*/, &r); return true; }
+    if (i_w2sRet) { r = i_w2sRet((void*)cam, w, 2); return true; }
+    return false;
+}
+
+// ---- локальный игрок и камера ----
+// Последний тик PlayerController.Update (ставит хук). Нет свежих тиков = лобби/загрузка, мира ещё нет.
+inline double lastPC = 0;
+inline bool InMatch() { return CACurrentMediaTime() - lastPC < 1.0; }
+
+// GetInstance - managed-метод: если инстанса нет, il2cpp кидает C++ исключение (NullReference).
+// Раньше его никто не ловил -> terminate -> abort. Теперь: ловим и не дёргаем метод 1 секунду.
+inline uintptr_t PMC() {
+    if (!base) return 0;
+    static double retryAt = 0;
     double now = CACurrentMediaTime();
-    if (g_deathFresh && now - g_deathT < 1.0) showKill(g_deathNick, &g_deathPos); else { g_fragPend = true; g_fragT = now; }
-}
-static void onDeath(void *p) {
-    double now = CACurrentMediaTime(); NSString *n = nickOf(p);
-    Vec3 pos = posOf(p); pos.y += C.headH * scaleOf(p) * 0.6f;   // примерно центр тела
-    if (g_fragPend && now - g_fragT < 1.0) showKill(n, &pos); else { g_deathNick = n; g_deathPos = pos; g_deathT = now; g_deathFresh = true; }
-}
-static void trackDeaths() {   // ищем игроков, которые только что умерли
-    if (!g_aliveMap) return;
-    NSArray *all; @synchronized (g_players) { all = g_players.allObjects; }
-    for (NSNumber *n in all) {
-        void *p = (void *)n.unsignedLongValue; if (p == g_local) continue;
-        bool a = alive(p); NSNumber *prev = g_aliveMap[n];
-        if (prev && prev.boolValue && !a) onDeath(p);
-        g_aliveMap[n] = @(a);
-    }
-    if (g_fragPend && CACurrentMediaTime() - g_fragT > 0.6) showKill(@"player", g_hasTarget ? &g_aim : NULL);   // ник не определился
-}
-
-static void h_Start(void *self, void *mi) {
-    fn_v_t o = (fn_v_t)origOf(mi); if (o) o(self, mi);
-    @synchronized (g_players) { [g_players addObject:@((uintptr_t)self)]; }
-    [g_aliveMap removeObjectForKey:@((uintptr_t)self)];
-    if (isMine(self)) g_local = self;
-}
-static void h_Destroy(void *self, void *mi) {
-    @synchronized (g_players) { [g_players removeObject:@((uintptr_t)self)]; }
-    [g_aliveMap removeObjectForKey:@((uintptr_t)self)];
-    if (g_local == self) g_local = NULL;
-    fn_v_t o = (fn_v_t)origOf(mi); if (o) o(self, mi);
-}
-
-static void applyVisuals() {
-    if (C.fog && RS_fog && RS_fogCol && RS_fogMode && RS_fogDens) { Col k = hsvCol(C.fogC); RS_fog(true); RS_fogCol(&k); RS_fogMode(2); RS_fogDens(0.1f); }
-    if (C.sky && Cam_clear && Cam_bg) {
-        if (RS_skybox) RS_skybox(NULL);
-        void *cam = pickCamera(); Col k = hsvCol(C.skyC);
-        if (cam) { Cam_clear(cam, 2); Cam_bg(cam, &k); }
+    if (now < retryAt) return 0;
+    using Fn = uintptr_t (*)();
+    try {
+        uintptr_t p = ((Fn)(base + OFF::RVA_PMC_GetInstance))();
+        return Valid(p) ? p : 0;
+    } catch (...) {
+        retryAt = now + 1.0;
+        return 0;
     }
 }
+inline uintptr_t LocalPlayer() { uintptr_t p = PMC(); return Valid(p) ? Ptr(p + OFF::PMC_Player) : 0; }
+inline uintptr_t UnityCamera() { uintptr_t p = PMC(); return Valid(p) ? Ptr(p + OFF::PMC_Camera) : 0; }
 
-static bool g_aspOn;
-static void applyAspect() {   // растянутое разрешение: подменяем aspect основной камеры, при выключении возвращаем
-    if (!Cam_setAsp) return;
-    if (C.aspectOn) { void *cam = pickCamera(); if (cam) { Cam_setAsp(cam, fmaxf(0.5f, C.aspect)); g_aspOn = true; } }
-    else if (g_aspOn) { void *cam = pickCamera(); if (cam && Cam_resetAsp) Cam_resetAsp(cam); g_aspOn = false; }
+inline uint8_t TeamOf(uintptr_t pc) { return Rd<uint8_t>(pc + OFF::PC_Team); }   // 1=Tr 2=Ct
+inline uintptr_t BoneT(uintptr_t pc, int i) { return Ptr(Ptr(pc + OFF::PC_Biped) + 0x18 + 8 * i); }
+
+// Aspect / Fog / Sky: применяем каждый кадр, при выключении один раз возвращаем
+inline void ApplyWorldImpl();
+inline void ApplyWorld() {
+    if (!inited || !InMatch()) return;      // в лобби камеры/мира нет
+    try { ApplyWorldImpl(); } catch (...) {}  // icall'ы Camera/RenderSettings тоже кидают, если камера уже уничтожена
 }
-// ---------------- трассеры своих пуль ----------------
-struct Tracer { void *bul; Vec3 a, b; double last; bool used; };
-static Tracer g_tr[48]; static int g_myVid = -1;
-static void trackBullet(void *bul) {
-    void *tr = *(void **)((uintptr_t)bul + OFF_BUL_Tr); if (!tr || !Tr_get_pos) return;
-    Vec3 p; Tr_get_pos(tr, &p); if (!isfinite(p.x + p.y + p.z)) return;
-    double now = CACurrentMediaTime(); Tracer *e = NULL, *fr = NULL, *oldest = &g_tr[0];
-    for (int i = 0; i < 48; i++) {
-        Tracer &t = g_tr[i];
-        if (t.used && t.bul == bul && now - t.last < 0.12) { e = &t; break; }
-        if (!t.used || now - t.last > 1.0) { if (!fr) fr = &t; }
-        if (t.last < oldest->last) oldest = &t;
+inline void ApplyWorldImpl() {
+    static bool wasA = false, wasF = false, wasS = false;
+    uintptr_t cam = UnityCamera();
+    bool a = [Cfg b:@"aspect"], s = [Cfg b:@"sky"], f = [Cfg b:@"fog"];
+    if (Valid(cam)) {
+        if (a && i_setAspect && i_sw && i_sh) {
+            float v = [Cfg f:@"aspect.val"]; if (v < 0.3f) v = 1.f;
+            i_setAspect((void*)cam, (float)i_sw() / (float)i_sh() * v); wasA = true;
+        } else if (wasA && i_resetAspect) { i_resetAspect((void*)cam); wasA = false; }
+        if (s && i_setClear && i_setBg) {
+            NSArray* c = [Cfg rgba:@"sky.c1"]; Col4 k = { [c[0] floatValue], [c[1] floatValue], [c[2] floatValue], 1.f };
+            i_setClear((void*)cam, 2 /*SolidColor*/); i_setBg((void*)cam, &k); wasS = true;
+        } else if (wasS && i_setClear) { i_setClear((void*)cam, 1 /*Skybox*/); wasS = false; }
     }
-    if (!e) { e = fr ? fr : oldest; e->bul = bul; e->a = p; e->used = true; }
-    e->b = p; e->last = now;
+    if (f && i_fog && i_fogCol) {
+        NSArray* c = [Cfg rgba:@"fog.c1"]; Col4 k = { [c[0] floatValue], [c[1] floatValue], [c[2] floatValue], 1.f };
+        i_fog(true); i_fogCol(&k); if (i_fogMode) i_fogMode(1 /*Linear*/); if (i_fogStart) i_fogStart(0.f); if (i_fogEnd) i_fogEnd(60.f);
+        wasF = true;
+    } else if (wasF && i_fog) { i_fog(false); wasF = false; }
 }
-static float g_baseSpeed, g_lastShoot; static int g_lastFrags = -1; static double g_dtT; static int g_dtLog;
-static void h_Update(void *self, void *mi) {
-    fn_v_t o = (fn_v_t)origOf(mi); if (o) o(self, mi);
-    if (!g_local && isMine(self)) g_local = self;
-    if (self != g_local) return;
-    g_gameFrames++; g_myVid = viewID(self);
-    bc("tgt"); updateTarget(); bc("vis"); applyVisuals(); bc("kill"); trackDeaths(); bc("idle");
+}   // namespace G
 
-    void *pwm = *(void **)((uintptr_t)self + OFF_CM_PWM);
-    void *w = pwm ? *(void **)((uintptr_t)pwm + OFF_PWM_Weapon) : NULL;
-    if (pwm && C.silent && g_hasTarget) *(Vec3 *)((uintptr_t)pwm + OFF_PWM_Target) = g_aim;
-    if (w && C.nospread) {
-        void *gi = *(void **)((uintptr_t)w + OFF_W_GunInfo);
-        if (gi) { Vec3 *e = (Vec3 *)((uintptr_t)gi + OFF_GI_ErrDelta); e->x = e->y = e->z = 0; }
+// ===== Игроки, ESP и эффекты (UIKit-слои, без Metal) =====
+namespace PS {                                   // состояние игроков
+inline std::unordered_map<uintptr_t, double> seen;   // PlayerController* -> время последнего Update (хук)
+inline uintptr_t lastVictim = 0; inline double lastHitT = 0;
+}
+
+static const char* WeaponName(uint8_t id) {
+    switch (id) {
+    case 11:return "G22";case 12:return "USP";case 13:return "P350";case 15:return "Deagle";case 16:return "Tec-9";case 17:return "FiveSeven";
+    case 32:return "UMP45";case 34:return "MP7";case 35:return "P90";case 36:return "MP5";case 37:return "MAC-10";
+    case 43:return "M4A1";case 44:return "AKR";case 45:return "AKR12";case 46:return "M4";case 47:return "M16";case 48:return "FAMAS";case 49:return "FN FAL";
+    case 51:return "AWM";case 52:return "M40";case 53:return "M110";
+    case 62:return "SM1014";case 63:return "FabM";case 64:return "M60";case 65:return "SPAS";
+    case 70:case 71:case 72:case 73:case 75:case 77:case 78:case 79:case 80:case 81:case 82:return "Knife";
+    case 91:return "HE";case 92:return "Smoke";case 93:return "Flash";case 100:return "Bomb";
+    default:return "";
     }
+}
 
-    // double tap: выстрел определяем по смене lastShootTime, повторяем PushBullet
-    float lst = *(float *)((uintptr_t)self + OFF_CM_LastShoot);
-    if (lst != g_lastShoot) {
-        bool fresh = g_lastShoot != 0; g_lastShoot = lst;
-        if (g_dtLog < 12) { g_dtLog++; NSLog(@"[DT] lastShootTime=%f", lst); }
-        double now = CACurrentMediaTime();
-        if (C.dtap && fresh && w && *(int *)((uintptr_t)w + OFF_W_Ammo) > 0 && now - g_dtT > 0.08) {
-            g_dtT = now;
-            FN(RVA_CM_PushBullet, void, void *, void *)(self, NULL);
-            g_lastShoot = *(float *)((uintptr_t)self + OFF_CM_LastShoot);
+struct EP {
+    uintptr_t pc = 0; CGPoint p[19]; bool ok[19]; int hp = 0, hpA = 0, hpB = 0; uint8_t team = 0, wid = 0;
+    NSString* name = @""; float dist = 0; bool enemy = true; Vec3 hip{0,0,0}; bool hasHip = false;
+};
+
+static bool BuildPlayers(std::vector<EP>& out, CGSize vs) {
+    out.clear();
+    if (!G::InMatch()) return false;
+    uintptr_t pmc = G::PMC(); if (!G::Valid(pmc)) return false;
+    uintptr_t cam = G::Ptr(pmc + OFF::PMC_Camera), local = G::Ptr(pmc + OFF::PMC_Player);
+    if (!G::Valid(cam) || !G::i_sw || !G::i_sh) return false;
+    float sw = (float)G::i_sw(), sh = (float)G::i_sh(); if (sw < 1 || sh < 1) return false;
+    Vec3 camPos{0,0,0}; G::Pos(G::Ptr(pmc + OFF::PMC_Transform), camPos);
+    uint8_t lteam = G::Valid(local) ? G::TeamOf(local) : 0;
+    bool showTeam = [Cfg b:@"esp.team"], swapHp = [Cfg b:@"hpswap"], dbg = [Cfg b:@"debug"], wantW = [Cfg b:@"esp.weapon"];
+    double now = CACurrentMediaTime();
+    for (auto it = PS::seen.begin(); it != PS::seen.end();) {
+        if (now - it->second > 0.5) { it = PS::seen.erase(it); continue; }   // перестал обновляться = мёртв/удалён
+        uintptr_t pc = it->first; ++it;
+        if (pc == local || out.size() >= 12) continue;
+        EP e; e.pc = pc; e.team = G::TeamOf(pc);
+        if (e.team != 1 && e.team != 2) continue;
+        e.enemy = (lteam == 0) || (e.team != lteam);
+        if (!e.enemy && !showTeam) continue;
+        e.hpA = G::Rd<int>(pc + OFF::PC_HpA); e.hpB = G::Rd<int>(pc + OFF::PC_HpB);
+        e.hp = swapHp ? e.hpB : e.hpA;
+        if (e.hp <= 0 && !dbg) continue;
+        uintptr_t biped = G::Ptr(pc + OFF::PC_Biped); if (!G::Valid(biped)) continue;
+        bool any = false; Vec3 anyW{0,0,0};
+        for (int i = 0; i < 19; i++) {
+            e.ok[i] = false;
+            Vec3 w; if (!G::Pos(G::Ptr(biped + 0x18 + 8 * i), w)) continue;
+            Vec3 r; if (!G::W2SRaw(cam, w, r)) continue;
+            if (i == 12) { e.hip = r; e.hasHip = true; }
+            if (r.z <= 0.01f) continue;
+            e.p[i] = CGPointMake(r.x * vs.width / sw, (sh - r.y) * vs.height / sh); e.ok[i] = true;
+            if (!any) { any = true; anyW = w; }
         }
-    }
-
-    // килсаунд: растёт счётчик фрагов
-    int fc = *(int *)((uintptr_t)self + OFF_CM_Frags);
-    if (g_lastFrags >= 0 && fc > g_lastFrags) { if (C.killsnd) playSnd(g_killP); onFrag(); }
-    g_lastFrags = fc;
-
-    // bhop
-    if (C.bhop) {
-        float *sp = (float *)((uintptr_t)self + OFF_CM_Speed);
-        if (g_baseSpeed == 0) g_baseSpeed = *sp;
-        *sp = g_baseSpeed * C.bhopMul;
-        if (FN(RVA_CM_IsGrounded, bool, void *, void *)(self, NULL)) FN(RVA_CM_Jump, void, void *, void *)(self, NULL);
-    } else if (g_baseSpeed != 0) { *(float *)((uintptr_t)self + OFF_CM_Speed) = g_baseSpeed; }
-    if (!g_hasLate) { applyOwnAA(self); applyAspect(); }
-}
-
-static void h_Late(void *self, void *mi) {
-    fn_v_t o = (fn_v_t)origOf(mi); if (o) o(self, mi);
-    if (self == g_local) { applyOwnAA(self); applyAspect(); }
-}
-
-// silent aim на самой пуле (Update у BaseBulletScript и подклассов)
-static int g_bulLog;
-static void h_BulUpdate(void *self, void *mi) {
-    if (g_local && C.silent && g_hasTarget && *(bool *)((uintptr_t)self + OFF_BUL_Orig)) {
-        int owner = *(int *)((uintptr_t)self + OFF_BUL_Owner);
-        float life = *(float *)((uintptr_t)self + OFF_BUL_Life);
-        if (life < 0.05f && owner == viewID(g_local)) {
-            bc("bul:enter");
-            Vec3 *dir = (Vec3 *)((uintptr_t)self + OFF_BUL_Dir);
-            if (g_bulLog < 10) { g_bulLog++; NSLog(@"[BUL] owner=%d dir=%f %f %f aim=%f %f %f", owner, dir->x, dir->y, dir->z, g_aim.x, g_aim.y, g_aim.z); }
-            void *tr = *(void **)((uintptr_t)self + OFF_BUL_Tr);
-            if (tr && Tr_get_pos) {
-                bc("bul:pos"); Vec3 p; Tr_get_pos(tr, &p);
-                Vec3 d = {g_aim.x - p.x, g_aim.y - p.y, g_aim.z - p.z};
-                float l = sqrtf(d.x*d.x + d.y*d.y + d.z*d.z);
-                if (l > 0.001f && isfinite(l)) {
-                    d.x /= l; d.y /= l; d.z /= l; *dir = d;
-                    if (Quat_Look && Tr_set_rot) {
-                        bc("bul:look"); Vec3 up = {0, 1, 0}; Quat q; Quat_Look(&d, &up, &q);
-                        bc("bul:setrot"); Tr_set_rot(tr, &q);
-                    }
-                }
-            }
-            bc("idle");
+        if (!any && !e.hasHip) continue;
+        float dx = anyW.x - camPos.x, dy = anyW.y - camPos.y, dz = anyW.z - camPos.z; e.dist = sqrtf(dx*dx + dy*dy + dz*dz);
+        e.name = G::Str(G::Ptr(G::Ptr(pc + OFF::PC_PhotonPlayer) + OFF::PP_Nick));
+        if (wantW) {
+            uintptr_t wc = G::Ptr(pc + OFF::PC_Weaponry), cur = G::Valid(wc) ? G::Ptr(wc + OFF::WC_Current) : 0;
+            if (G::Valid(cur)) e.wid = ((uint8_t (*)(void*, void*))(G::base + OFF::RVA_WeaponId))((void*)cur, nullptr);
         }
+        out.push_back(e);
     }
-    fn_v_t o = (fn_v_t)origOf(mi); if (o) o(self, mi);
-    if (C.tracers && g_local && g_myVid >= 0 && *(int *)((uintptr_t)self + OFF_BUL_Owner) == g_myVid) trackBullet(self);
+    return true;
 }
 
-// хитмаркер / хитсаунд (DamageReciver2.Damage, vtable)
-static int g_dmgLog;
-static void h_Damage(void *self, float dmg, int from, void *mi) {
-    bc("dmg:orig");
-    fn_dmg_t o = (fn_dmg_t)origOf(mi); if (o) o(self, dmg, from, mi);
-    bc("dmg:post");
-    if (g_dmgLog < 15) { g_dmgLog++; NSLog(@"[HIT] dmg=%f from=%d local=%d", dmg, from, g_local ? viewID(g_local) : -1); }
-    if (g_local && from == viewID(g_local)) {
-        double now = CACurrentMediaTime();
-        g_hitDmg = (now - g_hitTime < 0.25) ? g_hitDmg + dmg : dmg;   // dtap / несколько пуль складываем
-        g_hitTime = now;
-        if (C.hitsnd) playSnd(g_hitP);
+// экранная точка таза игрока (для эффекта убийства)
+static CGPoint ScreenOf(uintptr_t pc, CGSize vs) {
+    uintptr_t cam = G::UnityCamera(); Vec3 w, r;
+    if (G::i_sw && G::Pos(G::BoneT(pc, 12), w) && G::W2SRaw(cam, w, r) && r.z > 0) {
+        float sw = (float)G::i_sw(), sh = (float)G::i_sh();
+        return CGPointMake(r.x * vs.width / sw, (sh - r.y) * vs.height / sh);
     }
-    bc("idle");
+    return CGPointMake(vs.width / 2, vs.height / 2);
 }
 
-// anti-aim: на время сериализации поворачиваем трансформ, потом возвращаем
-static int g_aaTick; static float g_aaSpin, g_aaLastYaw, g_serRate = 10.f; static double g_serT;
-static bool g_inSer, g_cap; static int g_snLog; static NSMutableString *g_snText;
-static float aaYawDeg() {
-    float y = C.aaBase;
-    switch (C.aaMode) {
-        case 0: y += (g_aaTick & 1) ? C.aaOff : -C.aaOff; break;                     // jitter
-        case 1: g_aaSpin = fmodf(g_aaSpin + C.aaSpin, 360.f); y += g_aaSpin; break;  // spin
-        case 2: break;                                                                // static
-        case 3: y += ((float)arc4random_uniform(2001) / 1000.f - 1.f) * C.aaOff; break; // random
-    }
-    return y;
+static UIColor* ColK(NSString* key, NSString* sfx) {
+    NSArray* a = [Cfg rgba:[key stringByAppendingString:sfx]];
+    return [UIColor colorWithRed:[a[0] floatValue] green:[a[1] floatValue] blue:[a[2] floatValue] alpha:[a[3] floatValue]];
 }
-static void h_Ser(void *self, void *stream, void *info, void *mi) {
-    fn_ser_t o = (fn_ser_t)origOf(mi);
-    bool ours = self == g_local && stream && *(bool *)((uintptr_t)stream + OFF_PS_Writing);
-    void *tr = NULL; Quat saved = {0, 0, 0, 1};
-    if (C.aa && ours && Comp_get_tr && Tr_get_rot && Tr_set_rot) {
-        bc("ser:aa");
-        tr = Comp_get_tr(self);
-        if (tr) {
-            Tr_get_rot(tr, &saved); g_aaTick++;
-            float yd = aaYawDeg(); g_aaLastYaw = yd;
-            double nowT = CACurrentMediaTime();
-            if (g_serT > 0) { double d = nowT - g_serT; if (d > 0.01 && d < 1.0) g_serRate = g_serRate * 0.8f + (float)(1.0 / d) * 0.2f; }
-            g_serT = nowT;
-            float a = yd * (float)M_PI / 180.f;
-            Quat qy = {0, sinf(a / 2), 0, cosf(a / 2)};
-            float pr = C.aaPitch * (float)M_PI / 180.f; Quat qx = {sinf(pr / 2), 0, 0, cosf(pr / 2)};
-            Quat q = qmul(qy, qmul(saved, qx));   // yaw вокруг мировой Y, pitch вокруг локальной X
-            Tr_set_rot(tr, &q);
-        }
-    }
-    if (ours && g_cap) { g_inSer = true; g_snLog = 0; [g_snText setString:@""]; }
-    if (o) o(self, stream, info, mi);
-    if (g_inSer) { g_inSer = false; g_cap = false; }
-    if (tr) { Tr_set_rot(tr, &saved); bc("idle"); }
+static CAGradientLayer* MkG(CALayer* parent, BOOL fill, CAShapeLayer** mo) {
+    CAGradientLayer* g = [CAGradientLayer layer]; CAShapeLayer* m = [CAShapeLayer layer];
+    m.fillColor = (fill ? UIColor.whiteColor : UIColor.clearColor).CGColor;
+    m.strokeColor = (fill ? UIColor.clearColor : UIColor.whiteColor).CGColor;
+    m.lineWidth = 1.4; m.lineJoin = kCALineJoinRound; m.lineCap = kCALineCapRound;
+    g.mask = m; g.hidden = YES; [parent addSublayer:g]; *mo = m; return g;
+}
+static CATextLayer* MkT(CALayer* p, NSString* align) {
+    CATextLayer* t = [CATextLayer layer]; t.fontSize = 10; t.alignmentMode = align; t.contentsScale = UIScreen.mainScreen.scale;
+    t.foregroundColor = UIColor.whiteColor.CGColor; t.shadowOpacity = 1; t.shadowRadius = 1.2; t.shadowOffset = CGSizeZero; t.shadowColor = UIColor.blackColor.CGColor;
+    t.hidden = YES; [p addSublayer:t]; return t;
+}
+static CAShapeLayer* MkS(CALayer* p) { CAShapeLayer* s = [CAShapeLayer layer]; s.hidden = YES; [p addSublayer:s]; return s; }
+
+@interface EspSlot : NSObject
+@property (nonatomic) CAGradientLayer *boxG, *cornG, *skelG, *hatG;
+@property (nonatomic) CAShapeLayer *boxM, *cornM, *skelM, *hatM, *hp, *hpBg, *glow;
+@property (nonatomic) CATextLayer *nick, *dist, *wep, *dbg;
+- (instancetype)initIn:(CALayer*)p;
+- (void)hide;
+@end
+@implementation EspSlot
+- (instancetype)initIn:(CALayer*)p {
+    self = [super init]; CAShapeLayer *a, *b, *c, *d;
+    _glow = MkS(p); _glow.fillColor = UIColor.clearColor.CGColor; _glow.lineWidth = 1; _glow.shadowOffset = CGSizeZero; _glow.shadowOpacity = 1;
+    _boxG = MkG(p, NO, &a); _boxM = a; _cornG = MkG(p, NO, &b); _cornM = b; _skelG = MkG(p, NO, &c); _skelM = c; _hatG = MkG(p, YES, &d); _hatM = d;
+    _hpBg = MkS(p); _hpBg.fillColor = [UIColor colorWithWhite:0 alpha:0.6].CGColor; _hp = MkS(p);
+    _nick = MkT(p, kCAAlignmentCenter); _dist = MkT(p, kCAAlignmentCenter); _wep = MkT(p, kCAAlignmentCenter); _dbg = MkT(p, kCAAlignmentLeft);
+    return self;
+}
+- (void)hide {
+    for (CALayer* l in @[_boxG, _cornG, _skelG, _hatG, _hp, _hpBg, _glow, _nick, _dist, _wep, _dbg]) l.hidden = YES;
+}
+@end
+
+static const int kSlots = 12;
+static const int kBn[][2] = {{0,1},{1,3},{3,2},{2,12},{1,4},{4,5},{5,6},{6,7},{1,8},{8,9},{9,10},{10,11},{12,13},{13,14},{14,15},{12,16},{16,17},{17,18}};
+
+static void SetG(CAGradientLayer* g, NSString* key, CGRect fr, CGSize vs) {
+    UIColor *c1 = ColK(key, @".c1"), *c2 = ColK(key, @".c2"); BOOL grad = [Cfg i:[key stringByAppendingString:@".mode"]] == 1;
+    g.frame = CGRectMake(0, 0, vs.width, vs.height); ((CAShapeLayer*)g.mask).frame = g.bounds;
+    g.colors = @[(id)c1.CGColor, (id)(grad ? c2 : c1).CGColor];
+    CGFloat y0 = fr.origin.y / vs.height, y1 = (fr.origin.y + fr.size.height) / vs.height; if (y1 - y0 < 0.01) y1 = y0 + 0.01;
+    g.startPoint = CGPointMake(0.5, y0); g.endPoint = CGPointMake(0.5, y1); g.hidden = NO;
 }
 
-// диагностика: что именно игра пишет в поток при синхронизации (PhotonStream.SendNext)
-typedef void (*fn_send_t)(void *, void *, void *);
-static void h_SendNext(void *self, void *obj, void *mi) {
-    fn_send_t o = (fn_send_t)origOf(mi);
-    if (g_inSer && obj && g_snLog < 40 && il2cpp_object_get_class && il2cpp_class_get_name) {
-        void *k = il2cpp_object_get_class(obj);
-        const char *nm = k ? il2cpp_class_get_name(k) : NULL;
-        if (nm) {
-            float *f = (float *)((uintptr_t)obj + 0x10);
-            NSString *v = @"";
-            if (!strcmp(nm, "Quaternion")) v = [NSString stringWithFormat:@"%.2f %.2f %.2f %.2f", f[0], f[1], f[2], f[3]];
-            else if (!strcmp(nm, "Vector3")) v = [NSString stringWithFormat:@"%.2f %.2f %.2f", f[0], f[1], f[2]];
-            else if (!strcmp(nm, "Single")) v = [NSString stringWithFormat:@"%.2f", f[0]];
-            else if (!strcmp(nm, "Int32")) v = [NSString stringWithFormat:@"%d", *(int *)f];
-            else if (!strcmp(nm, "Boolean")) v = *(bool *)f ? @"true" : @"false";
-            g_snLog++;
-            [g_snText appendFormat:@"%d:%s %@  |  ", g_snLog, nm, v];
-        }
-    }
-    if (o) o(self, obj, mi);
-}
+@interface EspView : UIView
++ (instancetype)shared;
+- (void)hitMarker;
+- (void)logLine:(NSString*)s;
+- (void)killFxAt:(CGPoint)p;
+@end
 
-// ---------------- ESP ----------------
-static UIFont *gsF(CGFloat s);
-// ---------------- текст ESP / хитмаркера (обычный жирный шрифт с тенью) + чёрно-белый градиент ----------------
-static UIFont *esFont(CGFloat sz) {
-    static NSMutableDictionary<NSNumber *, UIFont *> *cache; if (!cache) cache = [NSMutableDictionary new];
-    UIFont *f = cache[@(sz)]; if (!f) { f = [UIFont boldSystemFontOfSize:sz]; cache[@(sz)] = f; } return f;
+@implementation EspView {
+    NSMutableArray<EspSlot*>* _slots; CAShapeLayer *_arrows, *_hm; CATextLayer *_log, *_stat;
+    CFTimeInterval _hmT; NSMutableArray* _logs; int _n; UIImage* _dot;
 }
-static CGFloat esWidth(NSString *t, CGFloat sz) { return [t sizeWithAttributes:@{NSFontAttributeName: esFont(sz)}].width; }
-static void esText(NSString *t, CGFloat x, CGFloat y, CGFloat sz, CGFloat al) {
-    UIFont *f = esFont(sz);
-    [t drawAtPoint:CGPointMake(x + 1, y + 1) withAttributes:@{NSFontAttributeName: f, NSForegroundColorAttributeName: [UIColor colorWithWhite:0 alpha:0.85 * al]}];
-    [t drawAtPoint:CGPointMake(x, y) withAttributes:@{NSFontAttributeName: f, NSForegroundColorAttributeName: [UIColor colorWithWhite:1 alpha:al]}];
++ (instancetype)shared { static EspView* v; static dispatch_once_t o; dispatch_once(&o, ^{ v = [[EspView alloc] initWithFrame:UIScreen.mainScreen.bounds]; }); return v; }
+- (instancetype)initWithFrame:(CGRect)f {
+    self = [super initWithFrame:f]; self.userInteractionEnabled = NO; self.backgroundColor = UIColor.clearColor;
+    _slots = [NSMutableArray new]; _logs = [NSMutableArray new];
+    for (int i = 0; i < kSlots; i++) [_slots addObject:[[EspSlot alloc] initIn:self.layer]];
+    _arrows = MkS(self.layer);
+    _hm = MkS(self.layer); _hm.strokeColor = UIColor.whiteColor.CGColor; _hm.lineWidth = 1.6; _hm.fillColor = nil;
+    _log = MkT(self.layer, kCAAlignmentLeft); _log.fontSize = 11; _log.frame = CGRectMake(56, 12, 300, 90);
+    _stat = MkT(self.layer, kCAAlignmentLeft); _stat.fontSize = 10;
+    CADisplayLink* dl = [CADisplayLink displayLinkWithTarget:self selector:@selector(tick)]; dl.preferredFramesPerSecond = 60;
+    [dl addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
+    return self;
 }
-static CGGradientRef mkGrad(const float *top, const float *bot) {   // loc 0 = низ (bot), loc 1 = верх (top); освобождать через CGGradientRelease
-    static CGColorSpaceRef cs; if (!cs) cs = CGColorSpaceCreateDeviceRGB();
-    Col a = hsvCol(bot), b = hsvCol(top); CGFloat comps[] = {a.r, a.g, a.b, 1, b.r, b.g, b.b, 1}; CGFloat locs[] = {0, 1};
-    return CGGradientCreateWithColorComponents(cs, comps, locs, 2);
+- (void)hitMarker { _hmT = CACurrentMediaTime(); }
+- (void)logLine:(NSString*)s { [_logs addObject:@[s, @(CACurrentMediaTime())]]; if (_logs.count > 6) [_logs removeObjectAtIndex:0]; }
+- (UIImage*)dot {
+    if (_dot) return _dot;
+    UIGraphicsImageRenderer* r = [[UIGraphicsImageRenderer alloc] initWithSize:CGSizeMake(32, 32)];
+    _dot = [r imageWithActions:^(UIGraphicsImageRendererContext* c) {
+        CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB(); CGFloat comps[8] = {1,1,1,1, 1,1,1,0}; CGFloat loc[2] = {0,1};
+        CGGradientRef g = CGGradientCreateWithColorComponents(cs, comps, loc, 2);
+        CGContextDrawRadialGradient(c.CGContext, g, CGPointMake(16,16), 0, CGPointMake(16,16), 16, 0);
+        CGGradientRelease(g); CGColorSpaceRelease(cs); }];
+    return _dot;
 }
-static CGGradientRef bwGrad() {   // 0 = чёрный, 1 = белый
-    static CGGradientRef g; if (!g) {
-        CGColorSpaceRef cs = CGColorSpaceCreateDeviceGray(); CGFloat comps[] = {0, 1, 1, 1}; CGFloat locs[] = {0, 1};
-        g = CGGradientCreateWithColorComponents(cs, comps, locs, 2); CGColorSpaceRelease(cs);
-    } return g;
+- (void)killFxAt:(CGPoint)pt {
+    CAEmitterLayer* e = [CAEmitterLayer layer]; e.emitterPosition = pt; e.emitterShape = kCAEmitterLayerPoint; e.renderMode = kCAEmitterLayerAdditive;
+    CAEmitterCell* c = [CAEmitterCell emitterCell]; c.contents = (id)[self dot].CGImage; c.birthRate = 160; c.lifetime = 0.9;
+    c.velocity = 150; c.velocityRange = 80; c.emissionRange = M_PI * 2; c.scale = 0.2; c.scaleRange = 0.1; c.scaleSpeed = -0.15;
+    c.alphaSpeed = -1.0; c.yAcceleration = 140; c.color = ColK(@"killparticle", @".c1").CGColor;
+    e.emitterCells = @[c]; [self.layer addSublayer:e];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.12 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ e.birthRate = 0; });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ [e removeFromSuperlayer]; });
 }
-
-// ---------------- иконки оружия / стрелки / прицел ----------------
-static NSString *clsName(void *o) {
-    if (!o || !il2cpp_object_get_class || !il2cpp_class_get_name) return @"";
-    void *k = il2cpp_object_get_class(o); const char *n = k ? il2cpp_class_get_name(k) : NULL;
-    return n ? [NSString stringWithUTF8String:n] : @"";
-}
-static bool hasAny(NSString *k, NSArray<NSString *> *ws) { for (NSString *w in ws) if ([k containsString:w]) return true; return false; }
-static int wpnKind(void *p) {   // 0 пистолет, 1 винтовка, 2 смг, 3 дробовик, 4 снайперка, 5 гранатомёт; -1 нет оружия
-    void *pwm = *(void **)((uintptr_t)p + OFF_CM_PWM); void *w = pwm ? *(void **)((uintptr_t)pwm + OFF_PWM_Weapon) : NULL;
-    if (!w) return -1;
-    void *gi = *(void **)((uintptr_t)w + OFF_W_GunInfo);
-    NSString *k = [[NSString stringWithFormat:@"%@ %@", clsName(w), clsName(gi)] lowercaseString];
-    static NSMutableSet *seen; if (!seen) seen = [NSMutableSet new];
-    if (![seen containsObject:k] && seen.count < 24) { [seen addObject:k]; NSLog(@"[WPN] %@", k); }   // что реально читается: смотри в логе
-    if (hasAny(k, @[@"rpg", @"bazooka", @"launcher", @"rocket", @"grenade"])) return 5;
-    if (hasAny(k, @[@"sniper", @"awp", @"barrett", @"dragunov", @"scout"])) return 4;
-    if (hasAny(k, @[@"shot", @"spas", @"sawed", @"pump"])) return 3;
-    if (hasAny(k, @[@"smg", @"uzi", @"mp5", @"mp7", @"mac", @"p90", @"vector", @"tommy"])) return 2;
-    if (hasAny(k, @[@"pistol", @"deagle", @"desert", @"revolver", @"glock", @"usp", @"colt", @"magnum"])) return 0;
-    return 1;
-}
-static void drawWpnIcon(CGContextRef c, int kind, CGFloat x, CGFloat cy, CGFloat bh) {
-    if (kind < 0) return;
-    CGFloat ih = fmin(14, fmax(6, bh * 0.22)), s = ih / 10.0;
-    CGMutablePathRef P = CGPathCreateMutable();
-    auto addR = [&](CGFloat a, CGFloat b, CGFloat w, CGFloat h) { CGPathAddRect(P, NULL, CGRectMake(a, b, w, h)); };
-    auto addQ = [&](std::initializer_list<CGPoint> pts) {
-        bool first = true;
-        for (CGPoint q : pts) { if (first) CGPathMoveToPoint(P, NULL, q.x, q.y); else CGPathAddLineToPoint(P, NULL, q.x, q.y); first = false; }
-        CGPathCloseSubpath(P);
-    };
-    switch (kind) {
-        case 0: addR(3, 1, 18, 3.4); addQ({{5, 4.4}, {11, 4.4}, {9.5, 9.6}, {5.7, 9.6}}); addR(11, 4.4, 4, 1.3); break;
-        case 2: addR(5, 2.8, 11, 3.2); addR(16, 3.5, 5, 1.4); addR(0.5, 3, 4.5, 1.6); addR(9, 6, 2.6, 4); addQ({{5.5, 6}, {8, 6}, {7.4, 9.4}, {5.6, 9.4}}); addR(11, 1.9, 3.5, 0.9); break;
-        case 3: addR(9, 2.6, 14.5, 1.6); addR(11, 4.3, 7, 1.5); addR(5.5, 2.6, 5, 3.2); addQ({{0, 2.6}, {5.5, 2.6}, {5.5, 6}, {2, 7.8}, {0, 6.5}}); break;
-        case 4: addR(11, 4, 12.5, 1.2); addR(4, 3, 8, 2.8); addR(7.5, 0.4, 7.5, 1.7); addR(9.5, 2, 1, 1.1); addR(13, 2, 1, 1.1);
-                addQ({{0, 3}, {4, 3}, {4, 6}, {1, 7.6}, {0, 5.6}}); addQ({{7, 5.8}, {9.5, 5.8}, {8.8, 9.2}, {6.8, 9.2}}); break;
-        case 5: addR(2, 2.4, 19, 3.4); addQ({{21, 2}, {23.8, 0.8}, {23.8, 7.4}, {21, 6.2}}); addQ({{8, 5.8}, {10.6, 5.8}, {9.8, 9.6}, {7.4, 9.6}}); break;
-        default: addR(6, 2.6, 12, 3.2); addR(18, 3.3, 6, 1.5); addQ({{0, 2.4}, {6, 2.6}, {6, 6}, {2, 7.6}, {0, 6}});
-                 addQ({{10.5, 5.8}, {14, 5.8}, {13.2, 9.8}, {10, 9.6}}); addR(12, 1.6, 4, 1); break;
+- (void)tick {
+    CGSize vs = self.bounds.size; if (vs.width < 1) return;
+    if (!G::inited && (_n++ % 120) == 0) { G::Init(); G::InitUnity(); }
+    [CATransaction begin]; [CATransaction setDisableActions:YES];
+    G::ApplyWorld();
+    CFTimeInterval now = CACurrentMediaTime();
+    // --- hitmarker ---
+    CGFloat ha = [Cfg b:@"hitmarker"] ? MAX(0, 1 - (now - _hmT) / 0.3) : 0;
+    _hm.hidden = ha <= 0;
+    if (ha > 0) {
+        CGPoint c = CGPointMake(vs.width / 2, vs.height / 2); UIBezierPath* p = [UIBezierPath bezierPath]; CGFloat a = 4, b = 11;
+        for (int sx = -1; sx <= 1; sx += 2) for (int sy = -1; sy <= 1; sy += 2) { [p moveToPoint:CGPointMake(c.x + sx*a, c.y + sy*a)]; [p addLineToPoint:CGPointMake(c.x + sx*b, c.y + sy*b)]; }
+        _hm.path = p.CGPath; _hm.opacity = ha;
     }
-    CGAffineTransform t = CGAffineTransformMake(s, 0, 0, s, x, cy - ih / 2);
-    CGPathRef tp = CGPathCreateCopyByTransformingPath(P, &t);
-    CGContextSaveGState(c); CGContextSetLineJoin(c, kCGLineJoinRound);
-    CGContextAddPath(c, tp); CGContextSetRGBStrokeColor(c, 0, 0, 0, 0.85f); CGContextSetLineWidth(c, 2); CGContextStrokePath(c);
-    CGContextAddPath(c, tp); CGContextSetRGBFillColor(c, 1, 1, 1, 1); CGContextFillPath(c);
-    CGContextRestoreGState(c); CGPathRelease(tp); CGPathRelease(P);
-}
-static void drawArrow(CGContextRef c, CGSize S, CGFloat dx, CGFloat dy, float dist) {   // стрелка на окружности вокруг центра экрана
-    CGFloat L = hypot(dx, dy); if (L < 1) { dx = 0; dy = 1; L = 1; } dx /= L; dy /= L;
-    CGFloat R = fmin(S.width, S.height) * 0.40, s = C.arrSize, cx = S.width / 2 + dx * R, cy = S.height / 2 + dy * R, nx = -dy, ny = dx;
-    CGFloat al = fmax(0.45, fmin(1.0, 1.0 - dist / 200.0)); Col k = hsvCol(C.arrC);
-    CGPoint T = {cx + dx * s * 1.2, cy + dy * s * 1.2}, A = {cx - dx * s * 0.6 + nx * s * 0.8, cy - dy * s * 0.6 + ny * s * 0.8};
-    CGPoint Bp = {cx - dx * s * 0.6 - nx * s * 0.8, cy - dy * s * 0.6 - ny * s * 0.8}, N = {cx - dx * s * 0.1, cy - dy * s * 0.1};
-    auto path = [&]() { CGContextMoveToPoint(c, T.x, T.y); CGContextAddLineToPoint(c, A.x, A.y); CGContextAddLineToPoint(c, N.x, N.y); CGContextAddLineToPoint(c, Bp.x, Bp.y); CGContextClosePath(c); };
-    CGContextSaveGState(c); CGContextSetLineJoin(c, kCGLineJoinRound);
-    CGContextSetBlendMode(c, kCGBlendModePlusLighter);
-    CGContextSetRGBStrokeColor(c, k.r, k.g, k.b, 0.10f * al); CGContextSetLineWidth(c, 8); path(); CGContextStrokePath(c);
-    CGContextSetRGBStrokeColor(c, k.r, k.g, k.b, 0.20f * al); CGContextSetLineWidth(c, 4); path(); CGContextStrokePath(c);
-    CGContextSetBlendMode(c, kCGBlendModeNormal);
-    CGContextSetRGBFillColor(c, k.r, k.g, k.b, al); path(); CGContextFillPath(c);
-    CGContextSetRGBStrokeColor(c, 0, 0, 0, 0.6f * al); CGContextSetLineWidth(c, 1); path(); CGContextStrokePath(c);
-    CGContextRestoreGState(c);
-}
-static void drawCrosshair(CGContextRef c, CGSize S) {
-    CGFloat cx = S.width / 2, cy = S.height / 2, s = C.xhSize, t = C.xhThick, g = C.xhGap, d1 = g * 0.7071, d2 = (g + s) * 0.7071; Col k = hsvCol(C.xhC);
-    CGContextSaveGState(c); CGContextSetLineJoin(c, kCGLineJoinMiter);
-    for (int pass = 0; pass < 2; pass++) {   // проход 0: чёрная обводка, проход 1: цвет
-        CGFloat w = pass == 0 ? t + 2 : t;
-        if (pass == 0) { CGContextSetRGBStrokeColor(c, 0, 0, 0, 0.75f); CGContextSetRGBFillColor(c, 0, 0, 0, 0.75f); }
-        else { CGContextSetRGBStrokeColor(c, k.r, k.g, k.b, 1); CGContextSetRGBFillColor(c, k.r, k.g, k.b, 1); }
-        CGContextSetLineWidth(c, w); CGContextSetLineCap(c, pass == 0 ? kCGLineCapSquare : kCGLineCapButt);
-        switch (C.xhShape) {
-            case 0:
-                CGContextMoveToPoint(c, cx - g, cy); CGContextAddLineToPoint(c, cx - g - s, cy);
-                CGContextMoveToPoint(c, cx + g, cy); CGContextAddLineToPoint(c, cx + g + s, cy);
-                CGContextMoveToPoint(c, cx, cy - g); CGContextAddLineToPoint(c, cx, cy - g - s);
-                CGContextMoveToPoint(c, cx, cy + g); CGContextAddLineToPoint(c, cx, cy + g + s);
-                CGContextStrokePath(c); break;
-            case 1: { CGFloat r = fmax(1, s * 0.3) + (pass == 0 ? 1 : 0); CGContextFillEllipseInRect(c, CGRectMake(cx - r, cy - r, r * 2, r * 2)); break; }
-            case 2: CGContextStrokeEllipseInRect(c, CGRectMake(cx - s, cy - s, s * 2, s * 2)); break;
-            case 3: CGContextStrokeRect(c, CGRectMake(cx - s, cy - s, s * 2, s * 2)); break;
-            case 4:
-                for (int sx = -1; sx <= 1; sx += 2) for (int sy = -1; sy <= 1; sy += 2) {
-                    CGContextMoveToPoint(c, cx + sx * d1, cy + sy * d1); CGContextAddLineToPoint(c, cx + sx * d2, cy + sy * d2);
-                }
-                CGContextStrokePath(c); break;
-            default:
-                CGContextMoveToPoint(c, cx, cy - s); CGContextAddLineToPoint(c, cx + s, cy); CGContextAddLineToPoint(c, cx, cy + s); CGContextAddLineToPoint(c, cx - s, cy);
-                CGContextClosePath(c); CGContextStrokePath(c); break;
-        }
-    }
-    CGContextRestoreGState(c);
-}
-
-@interface ESPView : UIView @end
-@implementation ESPView
-- (void)drawRect:(CGRect)r {
-    CGContextRef c = UIGraphicsGetCurrentContext(); CGSize S = self.bounds.size;
-    if (C.hitm) {
-        double age = CACurrentMediaTime() - g_hitTime; CGFloat cx = S.width / 2, cy = S.height / 2, a = 4, b = 10;
-        if (age < 0.25) {
-            CGContextSetStrokeColorWithColor(c, UIColor.whiteColor.CGColor); CGContextSetLineWidth(c, 1);
-            for (int sx = -1; sx <= 1; sx += 2) for (int sy = -1; sy <= 1; sy += 2) {
-                CGContextMoveToPoint(c, cx + sx * a, cy + sy * a); CGContextAddLineToPoint(c, cx + sx * b, cy + sy * b);
-            }
-            CGContextStrokePath(c);
-        }
-        if (age < 0.8) {   // надпись слева от хитмаркера
-            CGFloat al = age > 0.5 ? (0.8 - age) / 0.3 : 1.0, fs = 10;
-            NSString *t = [NSString stringWithFormat:@"SHOOT -%d", (int)lroundf(g_hitDmg)];
-            esText(t, cx - b - 5 - esWidth(t, fs), cy - fs * 0.6, fs, al);
-        }
-    }
-    if (g_killNick) {
-        double age = CACurrentMediaTime() - g_killT;
-        if (age >= 0 && age < 1.0) {
-            CGFloat al = age > 0.8 ? (1.0 - age) / 0.2 : (age < 0.08 ? age / 0.08 : 1.0);
-            UIFont *f2 = [UIFont fontWithName:@"Verdana-Bold" size:11] ?: gsF(11);
-            NSDictionary *a1 = @{NSFontAttributeName: gsF(10), NSForegroundColorAttributeName: [UIColor colorWithWhite:0.6 alpha:al]};
-            NSDictionary *a2 = @{NSFontAttributeName: f2, NSForegroundColorAttributeName: [UIColor colorWithWhite:0.96 alpha:al]};
-            NSString *s1 = @"killed  ";
-            CGFloat w1 = [s1 sizeWithAttributes:a1].width, w2 = [g_killNick sizeWithAttributes:a2].width;
-            CGFloat bw = w1 + w2 + 28, bh = 26, bx = (S.width - bw) / 2, by = 12;
-            CGRect box = CGRectMake(bx, by, bw, bh);
-            CGContextSetFillColorWithColor(c, [UIColor colorWithWhite:0.04 alpha:0.92 * al].CGColor); CGContextFillRect(c, box);
-            CGContextSetLineWidth(c, 1);
-            CGContextSetStrokeColorWithColor(c, [UIColor colorWithWhite:0.19 alpha:al].CGColor); CGContextStrokeRect(c, CGRectInset(box, 0.5, 0.5));
-            CGContextSetStrokeColorWithColor(c, [UIColor colorWithWhite:0.10 alpha:al].CGColor); CGContextStrokeRect(c, CGRectInset(box, 3.5, 3.5));
-            CGColorSpaceRef cs = CGColorSpaceCreateDeviceGray();
-            CGFloat comps[] = {0.18, al, 0.96, al, 0.18, al}; CGFloat locs[] = {0, 0.5, 1};
-            CGGradientRef gr = CGGradientCreateWithColorComponents(cs, comps, locs, 3);
-            CGContextSaveGState(c); CGContextClipToRect(c, CGRectMake(bx + 1, by + 1, bw - 2, 2));
-            CGContextDrawLinearGradient(c, gr, CGPointMake(bx + 1, by), CGPointMake(bx + bw - 1, by), 0);
-            CGContextRestoreGState(c); CGGradientRelease(gr); CGColorSpaceRelease(cs);
-            [s1 drawAtPoint:CGPointMake(bx + 14, by + 7) withAttributes:a1];
-            [g_killNick drawAtPoint:CGPointMake(bx + 14 + w1, by + 6) withAttributes:a2];
-        }
-    }
-    if (g_nSparks && Cam_w2s && Scr_w && Scr_h) {
-        void *cam = pickCamera(); float sw = Scr_w(), sh = Scr_h(); double now = CACurrentMediaTime(); int alive_n = 0;
-        if (cam && sw > 1 && sh > 1) {
-            CGContextSaveGState(c); CGContextSetBlendMode(c, kCGBlendModePlusLighter); CGContextSetLineCap(c, kCGLineCapRound);
-            for (int i = 0; i < g_nSparks; i++) {
-                Spark &k = g_sparks[i]; float t = (float)(now - k.born); if (t < 0 || t > k.life) continue; alive_n++;
-                const float G = -14.f;
-                auto at = [&](float tt) { return (Vec3){k.p.x + k.v.x * tt, k.p.y + k.v.y * tt + 0.5f * G * tt * tt, k.p.z + k.v.z * tt}; };
-                Vec3 w0 = at(fmaxf(0, t - 0.05f)), w1 = at(t), s0, s1;
-                Cam_w2s(cam, &w0, 2, &s0); Cam_w2s(cam, &w1, 2, &s1);
-                if (s0.z <= 0 || s1.z <= 0) continue;
-                CGPoint p0 = CGPointMake(s0.x / sw * S.width, (1 - s0.y / sh) * S.height), p1 = CGPointMake(s1.x / sw * S.width, (1 - s1.y / sh) * S.height);
-                float f = 1.f - t / k.life;   // 1 -> 0
-                CGContextSetRGBStrokeColor(c, 0.8f, 0.9f, 1, 0.20f * f); CGContextSetLineWidth(c, 3.4f);     // свечение
-                CGContextMoveToPoint(c, p0.x, p0.y); CGContextAddLineToPoint(c, p1.x, p1.y); CGContextStrokePath(c);
-                CGContextSetRGBStrokeColor(c, 1, 1, 1, fminf(1.f, f * 1.4f)); CGContextSetLineWidth(c, 0.45f + 0.2f * k.size * f);   // тонкое белое ядро
-                CGContextMoveToPoint(c, p0.x, p0.y); CGContextAddLineToPoint(c, p1.x, p1.y); CGContextStrokePath(c);
-            }
-            CGContextRestoreGState(c);
-        }
-        if (!alive_n) g_nSparks = 0;
-    }
-    if (C.xhair) drawCrosshair(c, S);
-    if (C.tracers && Cam_w2s && Scr_w && Scr_h) {   // тонкие светящиеся трассеры своих пуль
-        void *cam = pickCamera(); float sw = Scr_w(), sh = Scr_h(); double now = CACurrentMediaTime(); Col tc = hsvCol(C.trC);
-        if (cam && sw > 1 && sh > 1) {
-            CGContextSaveGState(c); CGContextSetBlendMode(c, kCGBlendModePlusLighter); CGContextSetLineCap(c, kCGLineCapRound);
-            for (int i = 0; i < 48; i++) {
-                Tracer &t = g_tr[i]; if (!t.used) continue;
-                double idle = now - t.last; float al = idle < 0.08 ? 1.f : 1.f - (float)((idle - 0.08) / 0.35);
-                if (al <= 0) { t.used = false; continue; }
-                Vec3 a = t.a, b = t.b, sa, sb; Cam_w2s(cam, &a, 2, &sa); Cam_w2s(cam, &b, 2, &sb);
-                if (sa.z <= 0 || sb.z <= 0) continue;
-                CGPoint p0 = CGPointMake(sa.x / sw * S.width, (1 - sa.y / sh) * S.height), p1 = CGPointMake(sb.x / sw * S.width, (1 - sb.y / sh) * S.height);
-                CGContextSetRGBStrokeColor(c, tc.r, tc.g, tc.b, 0.10f * al); CGContextSetLineWidth(c, 6);   // внешнее свечение
-                CGContextMoveToPoint(c, p0.x, p0.y); CGContextAddLineToPoint(c, p1.x, p1.y); CGContextStrokePath(c);
-                CGContextSetRGBStrokeColor(c, tc.r, tc.g, tc.b, 0.25f * al); CGContextSetLineWidth(c, 3);   // внутреннее свечение
-                CGContextMoveToPoint(c, p0.x, p0.y); CGContextAddLineToPoint(c, p1.x, p1.y); CGContextStrokePath(c);
-                CGContextSetRGBStrokeColor(c, fminf(1, tc.r * 0.6f + 0.4f), fminf(1, tc.g * 0.6f + 0.4f), fminf(1, tc.b * 0.6f + 0.4f), al); CGContextSetLineWidth(c, C.trW);   // тонкое яркое ядро
-                CGContextMoveToPoint(c, p0.x, p0.y); CGContextAddLineToPoint(c, p1.x, p1.y); CGContextStrokePath(c);
-            }
-            CGContextRestoreGState(c);
-        }
-    }
-    if (!C.esp || !g_local || !Cam_w2s || !Scr_w || !Scr_h) return;
-    bc("esp"); void *cam = pickCamera(); if (!cam) { bc("idle"); return; }
-    float sw = Scr_w(), sh = Scr_h(); if (sw < 1 || sh < 1) { bc("idle"); return; }
-    NSArray *all; @synchronized (g_players) { all = g_players.allObjects; }
-    CGGradientRef gCn = mkGrad(C.cnTop, C.cnBot);
-    CGGradientRef gBox = mkGrad(C.boxTop, C.boxBot), gBar = mkGrad(C.barTop, C.barBot); Col glowC = hsvCol(C.boxTop); Vec3 myPos = posOf(g_local);
-    for (NSNumber *n in all) {
-        void *p = (void *)n.unsignedLongValue; if (p == g_local || !alive(p)) continue;
-        Vec3 f = posOf(p), h = f; h.y += C.headH * scaleOf(p) * 1.3f;
-        Vec3 sf, shd; Cam_w2s(cam, &f, 2, &sf); Cam_w2s(cam, &h, 2, &shd);
-        bool behind = sf.z <= 0 || shd.z <= 0;
-        CGFloat fx = sf.x / sw * S.width,  fy = (1 - sf.y / sh) * S.height;
-        CGFloat hx = shd.x / sw * S.width, hy = (1 - shd.y / sh) * S.height;
-        CGFloat mx0 = (fx + hx) / 2, my0 = (fy + hy) / 2;
-        if (behind || mx0 < 0 || mx0 > S.width || my0 < 0 || my0 > S.height) {   // вне экрана -> стрелка
-            if (C.arrows) {
-                float ex = f.x - myPos.x, ey = f.y - myPos.y, ez = f.z - myPos.z;
-                CGFloat dx = mx0 - S.width / 2, dy = my0 - S.height / 2; if (behind) { dx = -dx; dy = -dy; }   // за камерой w2s зеркалит x/y
-                drawArrow(c, S, dx, dy, sqrtf(ex * ex + ey * ey + ez * ez));
+    // --- hitlog ---
+    while (_logs.count && now - [((NSArray*)_logs[0])[1] doubleValue] > 3.5) [_logs removeObjectAtIndex:0];
+    if ([Cfg b:@"hitlog"] && _logs.count) {
+        NSMutableArray* ls = [NSMutableArray new]; for (NSArray* l in _logs) [ls addObject:l[0]];
+        _log.string = [ls componentsJoinedByString:@"\n"]; _log.hidden = NO;
+    } else _log.hidden = YES;
+    // --- ESP ---
+    std::vector<EP> ps; bool ok = false;
+    if ([Cfg b:@"esp"]) { try { ok = BuildPlayers(ps, vs); } catch (...) { ok = false; ps.clear(); } }
+    bool dbg = [Cfg b:@"debug"];
+    _stat.hidden = !dbg;
+    if (dbg) { _stat.string = [NSString stringWithFormat:@"%s | players:%d", G::status, (int)ps.size()]; _stat.frame = CGRectMake(12, vs.height - 20, vs.width - 24, 14); }
+    UIBezierPath* arr = [UIBezierPath bezierPath]; bool arrowsOn = [Cfg b:@"esp.arrows"]; CGFloat glowK = [Cfg f:@"esp.glow"];
+    for (int i = 0; i < kSlots; i++) {
+        EspSlot* s = _slots[i];
+        if (!ok || i >= (int)ps.size()) { [s hide]; continue; }
+        const EP& e = ps[i];
+        CGFloat minx = 1e9, miny = 1e9, maxx = -1e9, maxy = -1e9;
+        for (int b = 0; b < 19; b++) if (e.ok[b]) { minx = MIN(minx, e.p[b].x); maxx = MAX(maxx, e.p[b].x); miny = MIN(miny, e.p[b].y); maxy = MAX(maxy, e.p[b].y); }
+        bool vis = e.ok[0] && (e.ok[12] || e.ok[15] || e.ok[18]);
+        if (!vis) {
+            [s hide];
+            if (arrowsOn && e.enemy && e.hasHip) {      // стрелка за экраном
+                float sw = (float)G::i_sw(), sh = (float)G::i_sh();
+                CGPoint c = CGPointMake(vs.width / 2, vs.height / 2), q = CGPointMake(e.hip.x * vs.width / sw, (sh - e.hip.y) * vs.height / sh);
+                CGFloat dx = q.x - c.x, dy = q.y - c.y; if (e.hip.z <= 0) { dx = -dx; dy = -dy; }
+                CGFloat l = hypot(dx, dy); if (l < 1) l = 1; dx /= l; dy /= l;
+                CGFloat R = MIN(vs.width, vs.height) * 0.38; CGPoint a = CGPointMake(c.x + dx * R, c.y + dy * R);
+                [arr moveToPoint:CGPointMake(a.x + dx*16, a.y + dy*16)];
+                [arr addLineToPoint:CGPointMake(a.x - dx*6 - dy*11, a.y - dy*6 + dx*11)];
+                [arr addLineToPoint:CGPointMake(a.x - dx*6 + dy*11, a.y - dy*6 - dx*11)]; [arr closePath];
             }
             continue;
         }
-        CGFloat bh = fabs(fy - hy), bw = bh * 0.7, x = (fx + hx) / 2 - bw / 2, y = MIN(fy, hy);
-        if (bh < 0.5) continue;   // раньше было < 4 px: из-за этого ESP пропадал на дальних дистанциях
-        { CGFloat mid = y + bh / 2; bh *= 1.15; bw = bh * 0.75 * ((C.aspectOn && C.aspect > 0.1f) ? (sw / sh) / C.aspect : 1.f); x = (fx + hx) / 2 - bw / 2; y = mid - bh / 2; }   // рамка чуть крупнее
-        CGRect box = CGRectMake(x, y, bw, bh); float hp = fmaxf(0, fminf(100, getHP(p)));
-        if (C.lines) {   // ESP line: от выбранной точки старта к ногам
-            Col lc = hsvCol(C.lineC);
-            CGFloat ox = S.width / 2, oy = C.lineOrg == 1 ? S.height / 2 : (C.lineOrg == 2 ? 0 : S.height);
-            CGContextSaveGState(c); CGContextSetLineCap(c, kCGLineCapRound);
-            CGContextSetRGBStrokeColor(c, 0, 0, 0, 0.55f); CGContextSetLineWidth(c, C.lineW + 1.5f);   // тёмная подложка для читаемости
-            CGContextMoveToPoint(c, ox, oy); CGContextAddLineToPoint(c, fx, fy); CGContextStrokePath(c);
-            CGContextSetRGBStrokeColor(c, lc.r, lc.g, lc.b, 1); CGContextSetLineWidth(c, C.lineW);
-            CGContextMoveToPoint(c, ox, oy); CGContextAddLineToPoint(c, fx, fy); CGContextStrokePath(c);
-            CGContextRestoreGState(c);
+        CGFloat h = maxy - miny, top = miny - h * 0.12, bot = maxy + h * 0.04; h = bot - top;
+        CGFloat cx = (minx + maxx) / 2, w = h * 0.5, x0 = cx - w / 2, x1 = cx + w / 2;
+        CGRect rect = CGRectMake(x0, top, w, h);
+        UIBezierPath* sk = [UIBezierPath bezierPath];
+        for (auto& bn : kBn) if (e.ok[bn[0]] && e.ok[bn[1]]) { [sk moveToPoint:e.p[bn[0]]]; [sk addLineToPoint:e.p[bn[1]]]; }
+        UIBezierPath* bx = [UIBezierPath bezierPathWithRect:rect];
+        // box
+        s.boxG.hidden = ![Cfg b:@"esp.box"];
+        if (!s.boxG.hidden) { SetG(s.boxG, @"esp.box", rect, vs); s.boxM.path = bx.CGPath; }
+        // corner
+        s.cornG.hidden = ![Cfg b:@"esp.corner"];
+        if (!s.cornG.hidden) {
+            UIBezierPath* co = [UIBezierPath bezierPath]; CGFloat lw = w * 0.28, lh = h * 0.18;
+            auto cor = [&](CGPoint c, CGFloat dx, CGFloat dy) { [co moveToPoint:CGPointMake(c.x + dx*lw, c.y)]; [co addLineToPoint:c]; [co addLineToPoint:CGPointMake(c.x, c.y + dy*lh)]; };
+            cor(CGPointMake(x0, top), 1, 1); cor(CGPointMake(x1, top), -1, 1); cor(CGPointMake(x0, bot), 1, -1); cor(CGPointMake(x1, bot), -1, -1);
+            SetG(s.cornG, @"esp.corner", rect, vs); s.cornM.path = co.CGPath;
         }
-        if (C.glow) {   // мягкое белое свечение: несколько расширяющихся полупрозрачных обводок с аддитивным смешиванием
-            CGPathRef gp = CGPathCreateWithRoundedRect(box, 3, 3, NULL);
-            CGContextSaveGState(c); CGContextSetBlendMode(c, kCGBlendModePlusLighter); CGContextSetLineJoin(c, kCGLineJoinRound);
-            for (int gi = 0; gi < 4; gi++) {
-                CGContextSetRGBStrokeColor(c, glowC.r, glowC.g, glowC.b, 0.16f - gi * 0.035f); CGContextSetLineWidth(c, 4 + gi * 4);
-                CGContextAddPath(c, gp); CGContextStrokePath(c);
-            }
-            CGContextRestoreGState(c); CGPathRelease(gp);
+        // skeleton
+        s.skelG.hidden = ![Cfg b:@"esp.skel"];
+        if (!s.skelG.hidden) { SetG(s.skelG, @"esp.skel", rect, vs); s.skelM.path = sk.CGPath; }
+        // china hat
+        s.hatG.hidden = ![Cfg b:@"esp.hat"];
+        if (!s.hatG.hidden) {
+            CGPoint hp = e.p[0]; CGFloat r = h * 0.11; UIBezierPath* ht = [UIBezierPath bezierPath]; CGPoint apex = CGPointMake(hp.x, hp.y - h * 0.20);
+            [ht moveToPoint:apex];
+            for (int k = 0; k <= 24; k++) { CGFloat an = k * 2 * M_PI / 24; [ht addLineToPoint:CGPointMake(hp.x + cos(an) * r, hp.y - h * 0.05 + sin(an) * r * 0.3)]; }
+            [ht closePath];
+            CGRect hr = CGRectMake(hp.x - r, apex.y, r * 2, h * 0.15); SetG(s.hatG, @"esp.hat", hr, vs); s.hatM.path = ht.CGPath;
         }
-        if (C.corner) {   // угловые рамки с градиентом
-            CGFloat L = fmax(3, fmin(bw, bh) * 0.3), x0 = box.origin.x, y0 = box.origin.y, x1 = x0 + box.size.width, y1 = y0 + box.size.height;
-            auto corners = [&]() {
-                CGContextMoveToPoint(c, x0, y0 + L); CGContextAddLineToPoint(c, x0, y0); CGContextAddLineToPoint(c, x0 + L, y0);
-                CGContextMoveToPoint(c, x1 - L, y0); CGContextAddLineToPoint(c, x1, y0); CGContextAddLineToPoint(c, x1, y0 + L);
-                CGContextMoveToPoint(c, x1, y1 - L); CGContextAddLineToPoint(c, x1, y1); CGContextAddLineToPoint(c, x1 - L, y1);
-                CGContextMoveToPoint(c, x0 + L, y1); CGContextAddLineToPoint(c, x0, y1); CGContextAddLineToPoint(c, x0, y1 - L);
-            };
-            CGContextSetStrokeColorWithColor(c, [UIColor colorWithWhite:0.22 alpha:0.7].CGColor); CGContextSetLineWidth(c, 3.4); corners(); CGContextStrokePath(c);
-            CGContextSaveGState(c); CGContextSetLineWidth(c, 1.6); corners(); CGContextReplacePathWithStrokedPath(c); CGContextClip(c);
-            CGContextDrawLinearGradient(c, gCn, CGPointMake(0, y + bh), CGPointMake(0, y), 0); CGContextRestoreGState(c);
-        } else {
-        // подложка, чтобы чёрный конец градиента был виден на тёмном фоне
-        CGContextSetStrokeColorWithColor(c, [UIColor colorWithWhite:0.22 alpha:0.7].CGColor); CGContextSetLineWidth(c, 3); CGContextStrokeRect(c, box);
-        // рамка с градиентом: снизу чёрный -> сверху белый
-        CGContextSaveGState(c); CGContextSetLineWidth(c, 1.2); CGContextAddRect(c, box); CGContextReplacePathWithStrokedPath(c); CGContextClip(c);
-        CGContextDrawLinearGradient(c, gBox, CGPointMake(0, y + bh), CGPointMake(0, y), 0); CGContextRestoreGState(c);
+        // glow: свечение по контуру box + skeleton
+        s.glow.hidden = glowK <= 0;
+        if (!s.glow.hidden) {
+            UIBezierPath* gp = [UIBezierPath bezierPath]; if ([Cfg b:@"esp.box"]) [gp appendPath:bx]; if ([Cfg b:@"esp.skel"]) [gp appendPath:sk]; if (![Cfg b:@"esp.box"] && ![Cfg b:@"esp.skel"]) [gp appendPath:bx];
+            UIColor* gc = ColK([Cfg b:@"esp.box"] ? @"esp.box" : @"esp.skel", @".c1");
+            s.glow.path = gp.CGPath; s.glow.strokeColor = gc.CGColor; s.glow.shadowColor = gc.CGColor; s.glow.shadowRadius = glowK / 6.0;
         }
-        if (C.hpbar) {
-        // хп-бар слева: чёрный снизу, белый сверху
-        CGFloat bx = x - 6, bwid = 2.5, fh = bh * hp / 100.f;
-        CGContextSetFillColorWithColor(c, [UIColor colorWithWhite:0.10 alpha:0.85].CGColor); CGContextFillRect(c, CGRectMake(bx - 1, y - 1, bwid + 2, bh + 2));
-        CGContextSaveGState(c); CGContextClipToRect(c, CGRectMake(bx, y + bh - fh, bwid, fh));
-        CGContextDrawLinearGradient(c, gBar, CGPointMake(0, y + bh), CGPointMake(0, y), 0); CGContextRestoreGState(c);
-        CGContextSetStrokeColorWithColor(c, [UIColor colorWithWhite:0.32 alpha:1].CGColor); CGContextSetLineWidth(c, 1);
-        CGContextStrokeRect(c, CGRectMake(bx - 0.5, y - 0.5, bwid + 1, bh + 1));
-        // текст: хп у уровня бара, ник над боксом
-        NSString *hs = [NSString stringWithFormat:@"%d", (int)hp];
-        CGFloat hy2 = fmax(y - 2, fmin(y + bh - 8, y + bh - fh - 4));
-        esText(hs, bx - 3 - esWidth(hs, 8), hy2, 8, 1);
+        // hp
+        s.hp.hidden = s.hpBg.hidden = ![Cfg b:@"esp.hp"];
+        if (!s.hp.hidden) {
+            CGFloat f = MAX(0, MIN(1, e.hp / 100.0)), bxx = x0 - 6;
+            s.hpBg.path = [UIBezierPath bezierPathWithRect:CGRectMake(bxx - 1, top - 1, 4, h + 2)].CGPath;
+            s.hp.path = [UIBezierPath bezierPathWithRect:CGRectMake(bxx, bot - h * f, 2, h * f)].CGPath;
+            s.hp.fillColor = [UIColor colorWithRed:1 - f green:f blue:0.15 alpha:1].CGColor;
         }
-        NSString *nk = nickOf(p); if (nk.length > 16) nk = [nk substringToIndex:16];
-        esText(nk, x + bw / 2 - esWidth(nk, 9) / 2, y - 13, 9, 1);
-        if (C.weapon) drawWpnIcon(c, wpnKind(p), x + bw + 5, y + bh / 2, bh);   // значок оружия справа от рамки
-        if (C.dist) {   // дистанция под рамкой
-            float ddx = f.x - myPos.x, ddy = f.y - myPos.y, ddz = f.z - myPos.z;
-            NSString *ds = [NSString stringWithFormat:@"%dm", (int)lroundf(sqrtf(ddx * ddx + ddy * ddy + ddz * ddz))];
-            esText(ds, x + bw / 2 - esWidth(ds, 8) / 2, y + bh + 2, 8, 1);
-        }
+        // текст
+        s.nick.hidden = ![Cfg b:@"esp.nick"] || e.name.length == 0;
+        if (!s.nick.hidden) { s.nick.string = e.name; s.nick.foregroundColor = ColK(@"esp.nick", @".c1").CGColor; s.nick.frame = CGRectMake(cx - 70, top - 13, 140, 12); }
+        CGFloat by = bot + 1;
+        s.dist.hidden = ![Cfg b:@"esp.dist"];
+        if (!s.dist.hidden) { s.dist.string = [NSString stringWithFormat:@"%dm", (int)e.dist]; s.dist.frame = CGRectMake(cx - 40, by, 80, 12); by += 11; }
+        const char* wn = WeaponName(e.wid);
+        s.wep.hidden = ![Cfg b:@"esp.weapon"] || !*wn;
+        if (!s.wep.hidden) { s.wep.string = @(wn); s.wep.foregroundColor = [UIColor colorWithRed:1 green:.86 blue:.47 alpha:1].CGColor; s.wep.frame = CGRectMake(cx - 50, by, 100, 12); }
+        s.dbg.hidden = !dbg;
+        if (dbg) { s.dbg.string = [NSString stringWithFormat:@"A:%d B:%d T:%d", e.hpA, e.hpB, e.team]; s.dbg.frame = CGRectMake(x1 + 4, top, 90, 12); }
     }
-    CGGradientRelease(gBox); CGGradientRelease(gBar); CGGradientRelease(gCn);
-    bc("idle");
+    _arrows.hidden = !arrowsOn || arr.isEmpty;
+    if (!_arrows.hidden) { _arrows.path = arr.CGPath; _arrows.fillColor = ColK(@"esp.arrows", @".c1").CGColor; }
+    [CATransaction commit];
 }
 @end
 
-// ---------------- меню (стиль gamesense, чёрно-белое) ----------------
-#define GSC(v) [UIColor colorWithWhite:(v) / 255.0 alpha:1]
-static UIFont *gsF(CGFloat s) {
-    static NSMutableDictionary<NSNumber *, UIFont *> *cache; if (!cache) cache = [NSMutableDictionary new];
-    UIFont *f = cache[@(s)]; if (f) return f;
-    f = [UIFont fontWithName:@"Verdana" size:s] ?: [UIFont systemFontOfSize:s]; cache[@(s)] = f; return f;
+// ---- события боя: вызываются из хуков ----
+static void EvHit(NSString* victim, NSString* extra) {
+    Snd::OnHit();
+    dispatch_async(dispatch_get_main_queue(), ^{
+        EspView* v = [EspView shared];
+        if ([Cfg b:@"hitmarker"]) [v hitMarker];
+        if ([Cfg b:@"hitlog"]) [v logLine:[NSString stringWithFormat:@"Hit %@ %@", victim, extra]];
+    });
+}
+static void EvKill(uintptr_t victim) {
+    Snd::OnKill();
+    dispatch_async(dispatch_get_main_queue(), ^{
+        EspView* v = [EspView shared];
+        if ([Cfg b:@"killparticle"]) [v killFxAt:ScreenOf(victim, v.bounds.size)];
+    });
 }
 
-@interface GSCheck : UIView
-@property (nonatomic) bool *p; @property (nonatomic, copy) NSString *title;
-@end
-@implementation GSCheck
-- (void)drawRect:(CGRect)r {
-    bool on = _p && *_p; CGFloat cy = self.bounds.size.height / 2;
-    CGRect box = CGRectMake(0.5, cy - 4.5, 9, 9);
-    [GSC(on ? 232 : 20) setFill]; UIRectFill(box);
-    UIBezierPath *b = [UIBezierPath bezierPathWithRect:box]; b.lineWidth = 1; [GSC(on ? 255 : 62) setStroke]; [b stroke];
-    [_title drawAtPoint:CGPointMake(17, cy - 6.5) withAttributes:@{NSFontAttributeName: gsF(10), NSForegroundColorAttributeName: GSC(on ? 235 : 135)}];
+// ---- Bhop / скорость: вызывается из хука PlayerController.Update ----
+static void SetSpeed(uintptr_t mc, float v) { ((void (*)(void*, float, void*))(G::base + OFF::RVA_MC_Speed))((void*)mc, v, nullptr); }
+static void TickLocal(uintptr_t self) {
+    static float lastSpeed = 1.f; static bool wasOn = false; static int cnt = 0;
+    bool on = [Cfg b:@"bhop"];
+    if (!on && !wasOn) return;
+    if (self != G::LocalPlayer()) return;
+    uintptr_t mc = G::Ptr(self + OFF::PC_Movement); if (!G::Valid(mc)) return;
+    if (!on) { SetSpeed(mc, 1.f); wasOn = false; lastSpeed = 1.f; return; }
+    wasOn = true;
+    uintptr_t in = G::Ptr(mc + OFF::MC_Input);
+    if (G::Valid(in)) {
+        Vec3 mv = G::Rd<Vec3>(in + OFF::MI_Move); bool moving = fabsf(mv.x) + fabsf(mv.y) + fabsf(mv.z) > 0.1f;
+        uintptr_t cc = G::Ptr(mc + OFF::MC_CharCtrl);
+        bool gr = (G::i_grounded && G::Valid(cc)) ? G::i_grounded((void*)cc) : true;
+        if (moving && gr) G::Wr<uint8_t>(in + OFF::MI_Jump, 1);
+    }
+    float sp = [Cfg f:@"bhop.speed"]; if (sp < 1.f) sp = 1.f;
+    if (fabsf(sp - lastSpeed) > 0.01f || (++cnt % 120) == 0) { if (sp != 1.f || lastSpeed != 1.f) SetSpeed(mc, sp); lastSpeed = sp; }
 }
-- (void)touchesEnded:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e {
-    if (_p && CGRectContainsPoint(self.bounds, [t.anyObject locationInView:self])) { *_p = !*_p; [self setNeedsDisplay]; }
-}
-@end
 
-@interface GSSlider : UIView
-@property (nonatomic) float *p; @property (nonatomic) float mn, mx, step; @property (nonatomic, copy) NSString *title, *fmt;
-@end
-@implementation GSSlider
-- (void)drawRect:(CGRect)r {
-    CGFloat W = self.bounds.size.width; float v = _p ? *_p : 0;
-    [_title drawAtPoint:CGPointMake(0, 0) withAttributes:@{NSFontAttributeName: gsF(9), NSForegroundColorAttributeName: GSC(150)}];
-    NSString *vs = [NSString stringWithFormat:_fmt, (double)v];
-    NSDictionary *va = @{NSFontAttributeName: gsF(9), NSForegroundColorAttributeName: GSC(235)};
-    [vs drawAtPoint:CGPointMake(W - [vs sizeWithAttributes:va].width, 0) withAttributes:va];
-    CGRect bar = CGRectMake(0.5, 15.5, W - 1, 8);
-    [GSC(20) setFill]; UIRectFill(bar);
-    UIBezierPath *b = [UIBezierPath bezierPathWithRect:bar]; b.lineWidth = 1; [GSC(62) setStroke]; [b stroke];
-    CGFloat f = (_mx > _mn) ? (v - _mn) / (_mx - _mn) : 0; f = MAX(0.0, MIN(1.0, f));
-    CGFloat fw = (W - 3) * f;
-    [GSC(240) setFill]; UIRectFill(CGRectMake(1.5, 16.5, fw, 3));
-    [GSC(170) setFill]; UIRectFill(CGRectMake(1.5, 19.5, fw, 3));
-}
-- (void)applyTouch:(UITouch *)u {
-    CGFloat W = self.bounds.size.width; CGFloat f = ([u locationInView:self].x - 1.5) / (W - 3); f = MAX(0.0, MIN(1.0, f));
-    float v = _mn + (float)f * (_mx - _mn); if (_step > 0) v = roundf(v / _step) * _step;
-    if (_p) *_p = v; [self setNeedsDisplay];
-}
-- (void)touchesBegan:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e { [self applyTouch:t.anyObject]; }
-- (void)touchesMoved:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e { [self applyTouch:t.anyObject]; }
-@end
+// ===== Меню (UIKit, матовое стекло) =====
+// Menu.mm - меню в стиле матового стекла на UIKit (iOS 14+)
+#import <UIKit/UIKit.h>
+#import <objc/runtime.h>
+#include <vector>
 
-@interface GSCombo : UIView
-@property (nonatomic) int *p; @property (nonatomic, strong) NSArray<NSString *> *opts; @property (nonatomic, copy) NSString *title;
-@end
-@implementation GSCombo
-- (void)drawRect:(CGRect)r {
-    CGFloat W = self.bounds.size.width;
-    [_title drawAtPoint:CGPointMake(0, 0) withAttributes:@{NSFontAttributeName: gsF(9), NSForegroundColorAttributeName: GSC(150)}];
-    CGRect box = CGRectMake(0.5, 13.5, W - 1, 17);
-    [GSC(20) setFill]; UIRectFill(box);
-    UIBezierPath *b = [UIBezierPath bezierPathWithRect:box]; b.lineWidth = 1; [GSC(62) setStroke]; [b stroke];
-    int i = _p ? *_p : 0; NSString *s = (i >= 0 && i < (int)_opts.count) ? _opts[i] : @"";
-    [s drawAtPoint:CGPointMake(6, 16.5) withAttributes:@{NSFontAttributeName: gsF(10), NSForegroundColorAttributeName: GSC(220)}];
-    UIBezierPath *a = [UIBezierPath bezierPath];
-    [a moveToPoint:CGPointMake(W - 14, 19.5)]; [a addLineToPoint:CGPointMake(W - 6, 19.5)]; [a addLineToPoint:CGPointMake(W - 10, 24.5)]; [a closePath];
-    [GSC(150) setFill]; [a fill];
-}
-- (void)touchesEnded:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e {
-    if (_p && _opts.count && CGRectContainsPoint(self.bounds, [t.anyObject locationInView:self])) { *_p = (*_p + 1) % (int)_opts.count; [self setNeedsDisplay]; }
-}
-@end
 
-@interface GSBtn : UIView
-@property (nonatomic, copy) NSString *title; @property (nonatomic, copy) void (^act)(void);
-@end
-@implementation GSBtn { BOOL _down; }
-- (void)drawRect:(CGRect)r {
-    CGRect box = CGRectInset(self.bounds, 0.5, 0.5);
-    [GSC(_down ? 45 : 20) setFill]; UIRectFill(box);
-    UIBezierPath *b = [UIBezierPath bezierPathWithRect:box]; b.lineWidth = 1; [GSC(70) setStroke]; [b stroke];
-    NSDictionary *a = @{NSFontAttributeName: gsF(10), NSForegroundColorAttributeName: GSC(235)};
-    CGSize sz = [_title sizeWithAttributes:a];
-    [_title drawAtPoint:CGPointMake((self.bounds.size.width - sz.width) / 2, (self.bounds.size.height - sz.height) / 2) withAttributes:a];
-}
-- (void)touchesBegan:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e { _down = YES; [self setNeedsDisplay]; }
-- (void)touchesCancelled:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e { _down = NO; [self setNeedsDisplay]; }
-- (void)touchesEnded:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e {
-    _down = NO; [self setNeedsDisplay];
-    if (_act && CGRectContainsPoint(self.bounds, [t.anyObject locationInView:self])) _act();
-}
-@end
+enum { T_Toggle, T_Slider, T_Color, T_Gradient, T_Segment, T_Header };
+struct Item { int type; NSString* key; NSString* title; float mn, mx; NSArray* opts; };
 
-static UIView *g_panel; static ESPView *g_esp; static UILabel *g_snLabel; static UIView *g_mark; static UILabel *g_markLbl; static CAGradientLayer *g_markGrad;
-static int g_linkFrames; static double g_fpsT;
-static void markUpdate(int fps) {
-    NSMutableAttributedString *s = [NSMutableAttributedString new];
-    UIFont *fb = [UIFont fontWithName:@"Verdana-Bold" size:11] ?: gsF(11), *fn = gsF(10);
-    void (^add)(NSString *, UIFont *, CGFloat) = ^(NSString *x, UIFont *f, CGFloat w) {
-        [s appendAttributedString:[[NSAttributedString alloc] initWithString:x attributes:@{NSFontAttributeName: f, NSForegroundColorAttributeName: [UIColor colorWithWhite:w alpha:1]}]];
+static const std::vector<std::vector<Item>>& Pages() {   // порядок = вкладки
+    static const std::vector<std::vector<Item>> p = {
+    // VISUALS
+    { {T_Toggle,@"esp",@"ESP"}, {T_Toggle,@"esp.team",@"Show Teammates"}, {T_Gradient,@"esp.box",@"ESP Box"}, {T_Gradient,@"esp.corner",@"ESP Corner"},
+       {T_Gradient,@"esp.hat",@"China Hat"}, {T_Toggle,@"esp.hp",@"HP Bar"}, {T_Gradient,@"esp.skel",@"Skeleton"},
+       {T_Toggle,@"esp.weapon",@"Weapon"}, {T_Color,@"esp.nick",@"Nickname"}, {T_Toggle,@"esp.dist",@"Distance"},
+       {T_Color,@"esp.arrows",@"Offscreen Arrows"}, {T_Slider,@"esp.glow",@"Glow ESP",0,100},
+       {T_Color,@"chams",@"Chams"}, {T_Color,@"chams.weapon",@"Weapon Chams"} },
+    // AIM
+    { {T_Toggle,@"silent",@"Silent Aim"}, {T_Toggle,@"silent360",@"Silent Aim 360"},
+       {T_Slider,@"silent.fov",@"Silent FOV",1,180}, {T_Color,@"silent.fovcol",@"FOV Color"},
+       {T_Toggle,@"silent.fovview",@"FOV View"} },
+    // RAGE
+    { {T_Toggle,@"aa",@"Anti-Aim"}, {T_Segment,@"aa.mode",@"Mode",0,0,@[@"Jitter",@"Random",@"Static",@"Spin"]},
+       {T_Slider,@"aa.spin",@"Spin Speed",1,100}, {T_Slider,@"aa.angle",@"AA Angle",0,180},
+       {T_Slider,@"aa.yaw",@"Yaw",-180,180}, {T_Slider,@"aa.pitch",@"Pitch",-90,90},
+       {T_Slider,@"aa.jitter",@"Jitter Offset",0,90},
+       {T_Toggle,@"bhop",@"Bhop"}, {T_Slider,@"bhop.speed",@"Bhop Speed",1,10},
+       {T_Toggle,@"tp",@"Thirdperson"}, {T_Toggle,@"nospread",@"No Spread"},
+       {T_Toggle,@"norecoil",@"No Recoil"}, {T_Toggle,@"dt",@"Doubletap"} },
+    // MISC
+    { {T_Toggle,@"aspect",@"Aspect Ratio"}, {T_Slider,@"aspect.val",@"Stretch",0.5,2},
+       {T_Color,@"tracers",@"Bullet Tracers"},
+       {T_Toggle,@"killsound",@"Kill Sound"}, {T_Toggle,@"hitsound",@"Hit Sound"},
+       {T_Segment,@"hitsound.idx",@"Hit Sound",0,0,Snd::HitNames()},
+       {T_Slider,@"snd.volume",@"Volume",0,1},
+       {T_Toggle,@"hitmarker",@"Hitmarker"}, {T_Toggle,@"hitlog",@"Hitlog"},
+       {T_Color,@"killparticle",@"Kill Particle"}, {T_Color,@"fog",@"Custom Fog"}, {T_Color,@"sky",@"Custom Sky"}, {T_Toggle,@"probe",@"Probe (log.txt)"}, {T_Toggle,@"hpswap",@"Swap HP (0x118/0x11C)"}, {T_Toggle,@"debug",@"ESP Debug"} },
     };
-    add(@"vasya", fb, 0.96); add(@" ware", fb, 0.62); add(@"  |  ", fn, 0.35); add([NSString stringWithFormat:@"%d fps", fps], fn, 0.9);
-    g_markLbl.attributedText = s; [g_markLbl sizeToFit];
-    CGFloat lw = g_markLbl.frame.size.width, w = lw + 22;
-    g_markLbl.frame = CGRectMake(11, 0, lw, 24);
-    CGRect f = g_mark.frame; f.size.width = w; g_mark.frame = f; g_markGrad.frame = CGRectMake(0, 0, w, 2);
+    return p;
 }
-static NSMutableArray<UIView *> *g_pages; static NSMutableArray<UIButton *> *g_tabBtns;
-static void selectTab(int idx) {
-    for (int i = 0; i < (int)g_pages.count; i++) {
-        BOOL on = (i == idx); g_pages[i].hidden = !on;
-        UIButton *b = g_tabBtns[i]; b.backgroundColor = on ? GSC(24) : UIColor.clearColor;
-        [b setTitleColor:(on ? GSC(245) : GSC(125)) forState:UIControlStateNormal];
-        [b viewWithTag:99].hidden = !on;
-    }
-}
-@interface MenuH : NSObject
-- (void)tap:(id)b; - (void)tab:(UIButton *)b; - (void)pan:(UIPanGestureRecognizer *)g; - (void)fabPan:(UIPanGestureRecognizer *)g; - (void)markTick:(CADisplayLink *)l;
-@end
-@implementation MenuH
-- (void)tap:(id)b {
-    g_panel.hidden = !g_panel.hidden;
-    g_mark.layer.borderColor = (g_panel.hidden ? GSC(48) : GSC(235)).CGColor;
-}
-- (void)markTick:(CADisplayLink *)l {
-    g_linkFrames++; double now = CACurrentMediaTime(); if (g_fpsT == 0) g_fpsT = now;
-    if (now - g_fpsT >= 0.5) {
-        double dt = now - g_fpsT; int gf = g_gameFrames;
-        int fps = gf > 0 ? (int)lround(gf / dt) : (int)lround(g_linkFrames / dt);   // фпс игры; если игрока нет, то частота экрана
-        g_gameFrames = 0; g_linkFrames = 0; g_fpsT = now; markUpdate(fps);
-    }
-}
-- (void)fabPan:(UIPanGestureRecognizer *)g {
-    UIView *v = g.view; CGPoint tr = [g translationInView:v.superview];
-    v.center = CGPointMake(v.center.x + tr.x, v.center.y + tr.y); [g setTranslation:CGPointZero inView:v.superview];
-}
-- (void)tab:(UIButton *)b { selectTab((int)b.tag); }
-- (void)pan:(UIPanGestureRecognizer *)g {
-    UIView *sv = g_panel.superview; CGPoint t = [g translationInView:sv];
-    g_panel.center = CGPointMake(g_panel.center.x + t.x, g_panel.center.y + t.y); [g setTranslation:CGPointZero inView:sv];
-}
-@end
-static MenuH *g_h;
+static NSArray* TabNames() { return @[@"Visuals", @"Aim", @"Rage", @"Misc", @"Config"]; }
 
-static UIWindow *keyWin() {
-    for (UIScene *sc in UIApplication.sharedApplication.connectedScenes)
-        if ([sc isKindOfClass:UIWindowScene.class])
-            for (UIWindow *w in ((UIWindowScene *)sc).windows) if (w.isKeyWindow) return w;
-    return UIApplication.sharedApplication.windows.firstObject;
+static const void* kKey = &kKey; static const void* kLbl = &kLbl;
+static NSString* KeyOf(id v) { return objc_getAssociatedObject(v, kKey); }
+static UIColor* Col(NSArray* a) { return [UIColor colorWithRed:[a[0] floatValue] green:[a[1] floatValue] blue:[a[2] floatValue] alpha:[a[3] floatValue]]; }
+static NSArray* Arr(UIColor* c) { CGFloat r,g,b,a; [c getRed:&r green:&g blue:&b alpha:&a]; return @[@(r),@(g),@(b),@(a)]; }
+
+@interface PassWindow : UIWindow @end
+@implementation PassWindow
+- (UIView*)hitTest:(CGPoint)p withEvent:(UIEvent*)e {
+    UIView* v = [super hitTest:p withEvent:e];
+    return (v == self || v == self.rootViewController.view) ? nil : v;   // клики проходят в игру
+}
+@end
+
+@interface GlassMenu : UIViewController
+@property UIVisualEffectView* panel; @property UIStackView* stack; @property UIScrollView* scroll;
+@property UISegmentedControl* tabs; @property int tab;
+@end
+
+@implementation GlassMenu
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    [self defaults];
+    self.view.backgroundColor = UIColor.clearColor;
+    EspView* ev = [EspView shared]; ev.frame = self.view.bounds;
+    ev.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight; [self.view addSubview:ev];
+
+    CGFloat w = MIN(UIScreen.mainScreen.bounds.size.width * 0.62, 380), h = MIN(UIScreen.mainScreen.bounds.size.height * 0.8, 440);
+    _panel = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemUltraThinMaterialDark]];
+    _panel.frame = CGRectMake(40, 40, w, h);
+    _panel.layer.cornerRadius = 22; _panel.clipsToBounds = YES;
+    _panel.layer.borderWidth = 0.6; _panel.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.22].CGColor;
+    _panel.contentView.backgroundColor = [UIColor colorWithWhite:0 alpha:0.18];     // матовость
+    _panel.hidden = YES;
+    [self.view addSubview:_panel];
+
+    // перетаскивание за шапку
+    UIView* head = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w, 34)];
+    UILabel* t = [[UILabel alloc] initWithFrame:CGRectMake(16, 6, w - 32, 22)];
+    t.text = @"STANDARLING"; t.textColor = [UIColor colorWithWhite:1 alpha:0.9];
+    t.font = [UIFont systemFontOfSize:13 weight:UIFontWeightBold];
+    [head addSubview:t]; [_panel.contentView addSubview:head];
+    [head addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(drag:)]];
+
+    _tabs = [[UISegmentedControl alloc] initWithItems:TabNames()];
+    _tabs.frame = CGRectMake(12, 36, w - 24, 30); _tabs.selectedSegmentIndex = 0;
+    _tabs.overrideUserInterfaceStyle = UIUserInterfaceStyleDark;
+    [_tabs addTarget:self action:@selector(tabChanged) forControlEvents:UIControlEventValueChanged];
+    [_panel.contentView addSubview:_tabs];
+
+    _scroll = [[UIScrollView alloc] initWithFrame:CGRectMake(0, 74, w, h - 74)];
+    _stack = [UIStackView new]; _stack.axis = UILayoutConstraintAxisVertical; _stack.spacing = 6;
+    _stack.translatesAutoresizingMaskIntoConstraints = NO;
+    [_scroll addSubview:_stack]; [_panel.contentView addSubview:_scroll];
+    [NSLayoutConstraint activateConstraints:@[
+        [_stack.topAnchor constraintEqualToAnchor:_scroll.contentLayoutGuide.topAnchor constant:4],
+        [_stack.bottomAnchor constraintEqualToAnchor:_scroll.contentLayoutGuide.bottomAnchor constant:-12],
+        [_stack.leadingAnchor constraintEqualToAnchor:_scroll.frameLayoutGuide.leadingAnchor constant:12],
+        [_stack.trailingAnchor constraintEqualToAnchor:_scroll.frameLayoutGuide.trailingAnchor constant:-12]]];
+    [self rebuild];
+
+    // плавающая кнопка открытия
+    UIVisualEffectView* fab = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemThinMaterialDark]];
+    fab.frame = CGRectMake(8, 8, 36, 36); fab.layer.cornerRadius = 18; fab.clipsToBounds = YES;
+    fab.layer.borderWidth = 0.6; fab.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.3].CGColor;
+    [fab addGestureRecognizer:[[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(toggle)]];
+    [fab addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(drag:)]];
+    [self.view addSubview:fab];
+}
+- (void)drag:(UIPanGestureRecognizer*)g {
+    UIView* v = g.view.superview == _panel.contentView ? _panel : g.view;
+    CGPoint d = [g translationInView:self.view]; v.center = CGPointMake(v.center.x + d.x, v.center.y + d.y);
+    [g setTranslation:CGPointZero inView:self.view];
+}
+- (void)toggle { _panel.hidden = !_panel.hidden; }
+- (void)tabChanged { _tab = (int)_tabs.selectedSegmentIndex; [self rebuild]; }
+
+- (void)defaults {   // значения по умолчанию, не затираем загруженные
+    NSDictionary* def = @{ @"snd.volume": @0.8, @"silent.fov": @30, @"aa.spin": @20, @"aa.angle": @60, @"bhop.speed": @1,
+                           @"aspect.val": @1.0, @"hitsound.idx": @0, @"esp.glow": @0, @"esp": @YES, @"esp.box": @YES, @"esp.hp": @YES, @"esp.nick": @YES, @"esp.dist": @YES, @"esp.weapon": @YES, @"esp.skel": @YES, @"esp.arrows": @YES, @"hitmarker": @YES, @"hitlog": @YES, @"killparticle": @YES,
+        @"esp.box.c1": @[@1,@0.25,@0.25,@1], @"esp.box.c2": @[@1,@0.85,@0.2,@1], @"esp.corner.c1": @[@1,@1,@1,@1], @"esp.corner.c2": @[@0.4,@0.7,@1,@1], @"esp.skel.c1": @[@1,@1,@1,@1], @"esp.skel.c2": @[@0.4,@0.7,@1,@1], @"esp.hat.c1": @[@1,@0.4,@0.8,@1], @"esp.hat.c2": @[@0.5,@0.3,@1,@0.8], @"esp.nick.c1": @[@1,@1,@1,@1], @"esp.arrows.c1": @[@1,@0.2,@0.2,@1], @"killparticle.c1": @[@1,@0.8,@0.3,@1], @"fog.c1": @[@0.5,@0.5,@0.6,@1], @"sky.c1": @[@0.1,@0.1,@0.2,@1] };
+    for (NSString* k in def) if (![Cfg d][k]) [Cfg set:def[k] for:k];
 }
 
-@interface GSColor : UIView
-@property (nonatomic) float *hsv; @property (nonatomic, copy) NSString *title; @property (nonatomic) int active; @property (nonatomic, copy) void (^changed)(void);
-@end
-@implementation GSColor
-- (void)drawRect:(CGRect)r {
-    if (!_hsv) return; CGFloat W = self.bounds.size.width, bw = W - 3;
-    [_title drawAtPoint:CGPointMake(0, 0) withAttributes:@{NSFontAttributeName: gsF(9), NSForegroundColorAttributeName: GSC(150)}];
-    Col cc = hsvCol(_hsv); CGRect sw = CGRectMake(W - 24.5, 0.5, 24, 10);
-    [[UIColor colorWithRed:cc.r green:cc.g blue:cc.b alpha:1] setFill]; UIRectFill(sw);
-    UIBezierPath *sb = [UIBezierPath bezierPathWithRect:sw]; sb.lineWidth = 1; [GSC(90) setStroke]; [sb stroke];
-    for (int i = 0; i < 3; i++) {
-        CGFloat by = 14 + i * 9;
-        [GSC(20) setFill]; UIRectFill(CGRectMake(0.5, by, W - 1, 8));
-        for (CGFloat px = 0; px < bw; px += 2) {
-            float f = (float)(px / bw), t[3] = {_hsv[0], _hsv[1], _hsv[2]};
-            if (i == 0) { t[0] = f; t[1] = 1; t[2] = 1; } else if (i == 1) { t[1] = f; t[2] = 1; } else { t[2] = f; }
-            Col k = hsvCol(t); [[UIColor colorWithRed:k.r green:k.g blue:k.b alpha:1] setFill]; UIRectFill(CGRectMake(1.5 + px, by + 1.5, 2, 5));
+// ---------- сборка строк ----------
+- (UIStackView*)card {
+    UIStackView* r = [UIStackView new]; r.axis = UILayoutConstraintAxisHorizontal; r.alignment = UIStackViewAlignmentCenter;
+    r.spacing = 8; r.layoutMarginsRelativeArrangement = YES; r.layoutMargins = UIEdgeInsetsMake(8, 12, 8, 12);
+    UIView* bg = [[UIView alloc] initWithFrame:CGRectZero]; bg.backgroundColor = [UIColor colorWithWhite:1 alpha:0.07];
+    bg.layer.cornerRadius = 12; bg.translatesAutoresizingMaskIntoConstraints = NO; bg.userInteractionEnabled = NO;
+    [r insertSubview:bg atIndex:0];
+    [NSLayoutConstraint activateConstraints:@[[bg.topAnchor constraintEqualToAnchor:r.topAnchor], [bg.bottomAnchor constraintEqualToAnchor:r.bottomAnchor],
+        [bg.leadingAnchor constraintEqualToAnchor:r.leadingAnchor], [bg.trailingAnchor constraintEqualToAnchor:r.trailingAnchor]]];
+    return r;
+}
+- (UILabel*)label:(NSString*)s {
+    UILabel* l = [UILabel new]; l.text = s; l.textColor = [UIColor colorWithWhite:1 alpha:0.92];
+    l.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium]; [l setContentHuggingPriority:UILayoutPriorityDefaultLow forAxis:UILayoutConstraintAxisHorizontal];
+    return l;
+}
+- (UIColorWell*)well:(NSString*)key {
+    UIColorWell* w = [UIColorWell new]; w.supportsAlpha = YES; w.title = @"Color";
+    NSArray* a = [Cfg d][key]; w.selectedColor = a ? Col(a) : UIColor.whiteColor;
+    objc_setAssociatedObject(w, kKey, key, OBJC_ASSOCIATION_COPY_NONATOMIC);
+    [w addTarget:self action:@selector(colorChanged:) forControlEvents:UIControlEventValueChanged];
+    if (!a) [Cfg set:Arr(w.selectedColor) for:key];
+    return w;
+}
+- (UISwitch*)toggle:(NSString*)key {
+    UISwitch* sw = [UISwitch new]; sw.onTintColor = [UIColor colorWithRed:.45 green:.55 blue:1 alpha:1]; sw.on = [Cfg b:key];
+    objc_setAssociatedObject(sw, kKey, key, OBJC_ASSOCIATION_COPY_NONATOMIC);
+    [sw addTarget:self action:@selector(switched:) forControlEvents:UIControlEventValueChanged];
+    return sw;
+}
+- (void)rebuild {
+    for (UIView* v in _stack.arrangedSubviews) { [_stack removeArrangedSubview:v]; [v removeFromSuperview]; }
+    if (_tab == 4) { [self buildConfig]; return; }
+    for (const Item& it : Pages()[_tab]) {
+        UIStackView* r = [self card]; r.tag = 0;
+        switch (it.type) {
+        case T_Toggle: {
+            UISwitch* s = [UISwitch new]; s.onTintColor = [UIColor colorWithRed:.45 green:.55 blue:1 alpha:1];
+            s.on = [Cfg b:it.key]; objc_setAssociatedObject(s, kKey, it.key, OBJC_ASSOCIATION_COPY_NONATOMIC);
+            [s addTarget:self action:@selector(switched:) forControlEvents:UIControlEventValueChanged];
+            [r addArrangedSubview:[self label:it.title]]; [r addArrangedSubview:s]; break; }
+        case T_Slider: {
+            r.axis = UILayoutConstraintAxisVertical; r.alignment = UIStackViewAlignmentFill; r.spacing = 2;
+            UILabel* val = [self label:@""]; val.textAlignment = NSTextAlignmentRight; val.textColor = [UIColor colorWithWhite:1 alpha:0.6];
+            UIStackView* top = [UIStackView new]; [top addArrangedSubview:[self label:it.title]]; [top addArrangedSubview:val];
+            UISlider* s = [UISlider new]; s.minimumValue = it.mn; s.maximumValue = it.mx;
+            s.value = [Cfg d][it.key] ? [Cfg f:it.key] : it.mn; val.text = [NSString stringWithFormat:@"%.1f", s.value];
+            objc_setAssociatedObject(s, kKey, it.key, OBJC_ASSOCIATION_COPY_NONATOMIC); objc_setAssociatedObject(s, kLbl, val, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            [s addTarget:self action:@selector(slid:) forControlEvents:UIControlEventValueChanged];
+            [r addArrangedSubview:top]; [r addArrangedSubview:s]; break; }
+        case T_Color: {
+            [r addArrangedSubview:[self label:it.title]]; [r addArrangedSubview:[self toggle:it.key]];
+            [r addArrangedSubview:[self well:[it.key stringByAppendingString:@".c1"]]]; break; }
+        case T_Gradient: {
+            r.axis = UILayoutConstraintAxisVertical; r.alignment = UIStackViewAlignmentFill; r.spacing = 6;
+            UIStackView* top = [UIStackView new]; top.spacing = 8; top.alignment = UIStackViewAlignmentCenter;
+            [top addArrangedSubview:[self label:it.title]]; [top addArrangedSubview:[self toggle:it.key]];
+            [top addArrangedSubview:[self well:[it.key stringByAppendingString:@".c1"]]];
+            [top addArrangedSubview:[self well:[it.key stringByAppendingString:@".c2"]]];
+            UISegmentedControl* m = [[UISegmentedControl alloc] initWithItems:@[@"Solid", @"Gradient"]];
+            NSString* mk = [it.key stringByAppendingString:@".mode"]; m.selectedSegmentIndex = [Cfg i:mk];
+            objc_setAssociatedObject(m, kKey, mk, OBJC_ASSOCIATION_COPY_NONATOMIC);
+            [m addTarget:self action:@selector(segged:) forControlEvents:UIControlEventValueChanged];
+            m.overrideUserInterfaceStyle = UIUserInterfaceStyleDark;
+            [r addArrangedSubview:top]; [r addArrangedSubview:m]; break; }
+        case T_Segment: {
+            r.axis = UILayoutConstraintAxisVertical; r.alignment = UIStackViewAlignmentFill;
+            UISegmentedControl* m = [[UISegmentedControl alloc] initWithItems:it.opts]; m.selectedSegmentIndex = [Cfg i:it.key];
+            m.overrideUserInterfaceStyle = UIUserInterfaceStyleDark;
+            objc_setAssociatedObject(m, kKey, it.key, OBJC_ASSOCIATION_COPY_NONATOMIC);
+            [m addTarget:self action:@selector(segged:) forControlEvents:UIControlEventValueChanged];
+            [r addArrangedSubview:[self label:it.title]]; [r addArrangedSubview:m]; break; }
         }
-        UIBezierPath *b = [UIBezierPath bezierPathWithRect:CGRectMake(0.5, by + 0.5, W - 1, 7)]; b.lineWidth = 1; [GSC(62) setStroke]; [b stroke];
-        CGFloat mx = 1.5 + bw * _hsv[i];
-        [GSC(0) setFill]; UIRectFill(CGRectMake(mx - 1.5, by, 3, 8)); [GSC(245) setFill]; UIRectFill(CGRectMake(mx - 0.5, by, 1, 8));
+        [_stack addArrangedSubview:r];
     }
 }
-- (void)applyTouch:(UITouch *)u {
-    CGFloat f = ([u locationInView:self].x - 1.5) / (self.bounds.size.width - 3); f = MAX(0.0, MIN(1.0, f));
-    if (_hsv) _hsv[_active] = (float)f; [self setNeedsDisplay]; if (_changed) _changed();
-}
-- (void)touchesBegan:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e {
-    int i = (int)(([t.anyObject locationInView:self].y - 12) / 9); _active = MAX(0, MIN(2, i)); [self applyTouch:t.anyObject];
-}
-- (void)touchesMoved:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e { [self applyTouch:t.anyObject]; }
-@end
-static UIView *gsGroup(UIView *parent, NSString *title, CGFloat y, CGFloat w) {
-    UIView *g = [[UIView alloc] initWithFrame:CGRectMake(0, y, w, 40)];
-    g.backgroundColor = GSC(13); g.layer.borderColor = GSC(46).CGColor; g.layer.borderWidth = 1;
-    UILabel *l = [UILabel new]; l.text = [NSString stringWithFormat:@" %@ ", title.lowercaseString];
-    l.font = gsF(9); l.textColor = GSC(235); l.backgroundColor = GSC(10); [l sizeToFit];
-    l.frame = CGRectMake(8, -7, l.frame.size.width, 13);
-    [g addSubview:l]; [parent addSubview:g]; return g;
-}
-static CGFloat gsCheck(UIView *g, CGFloat y, const char *nm, bool *p) {
-    GSCheck *c = [[GSCheck alloc] initWithFrame:CGRectMake(10, y, g.bounds.size.width - 20, 20)];
-    c.backgroundColor = UIColor.clearColor; c.p = p; c.title = [NSString stringWithUTF8String:nm]; [g addSubview:c]; return y + 21;
-}
-static CGFloat gsSlider(UIView *g, CGFloat y, const char *nm, float *p, float mn, float mx, float step, NSString *fmt) {
-    GSSlider *s = [[GSSlider alloc] initWithFrame:CGRectMake(10, y, g.bounds.size.width - 20, 28)];
-    s.backgroundColor = UIColor.clearColor; s.p = p; s.mn = mn; s.mx = mx; s.step = step; s.fmt = fmt;
-    s.title = [NSString stringWithUTF8String:nm]; [g addSubview:s]; return y + 31;
-}
-static UIView *g_pop; static float *g_popHSV;
-@interface GSSwatch : UIView
-@property (nonatomic) float *c1, *c2; @property (nonatomic, weak) UIView *host; @property (nonatomic, copy) NSString *title;
-@end
-@implementation GSSwatch
-- (void)drawRect:(CGRect)r {
-    int n = _c2 ? 2 : 1;
-    for (int i = 0; i < n; i++) {
-        float *h = i == 0 ? _c1 : _c2; Col k = hsvCol(h); CGRect sq = CGRectMake(1.5 + i * 27, 1.5, 24, 10);
-        [[UIColor colorWithRed:k.r green:k.g blue:k.b alpha:1] setFill]; UIRectFill(sq);
-        UIBezierPath *b = [UIBezierPath bezierPathWithRect:sq]; b.lineWidth = 1; [(g_pop && g_popHSV == h ? GSC(245) : GSC(90)) setStroke]; [b stroke];
+- (void)buildConfig {
+    UIStackView* bar = [UIStackView new]; bar.spacing = 8; bar.distribution = UIStackViewDistributionFillEqually;
+    for (NSString* t in @[@"CFG SAVE", @"CFG LOAD"]) {
+        UIButton* b = [UIButton buttonWithType:UIButtonTypeSystem]; [b setTitle:t forState:UIControlStateNormal];
+        b.backgroundColor = [UIColor colorWithWhite:1 alpha:0.12]; b.layer.cornerRadius = 12; b.tintColor = UIColor.whiteColor;
+        [b.heightAnchor constraintEqualToConstant:40].active = YES;
+        [b addTarget:self action:([t hasSuffix:@"SAVE"] ? @selector(cfgSave) : @selector(cfgLoad)) forControlEvents:UIControlEventTouchUpInside];
+        [bar addArrangedSubview:b];
+    }
+    [_stack addArrangedSubview:bar];
+    NSString* sel = objc_getAssociatedObject(self, @selector(cfgLoad));
+    for (NSString* n in [Cfg list]) {                       // таблица конфигов
+        UIStackView* r = [self card]; [r addArrangedSubview:[self label:n]];
+        UIButton* b = [UIButton buttonWithType:UIButtonTypeSystem]; b.tintColor = UIColor.whiteColor;
+        [b setTitle:[n isEqualToString:sel] ? @"● selected" : @"select" forState:UIControlStateNormal];
+        objc_setAssociatedObject(b, kKey, n, OBJC_ASSOCIATION_COPY_NONATOMIC);
+        [b addTarget:self action:@selector(cfgPick:) forControlEvents:UIControlEventTouchUpInside];
+        [r addArrangedSubview:b]; [_stack addArrangedSubview:r];
     }
 }
-- (void)touchesEnded:(NSSet<UITouch *> *)t withEvent:(UIEvent *)e {
-    CGPoint p = [t.anyObject locationInView:self]; if (!CGRectContainsPoint(self.bounds, p)) return;
-    float *h = (_c2 && p.x > 27) ? _c2 : _c1;
-    BOOL same = g_pop && g_popHSV == h;
-    [g_pop removeFromSuperview]; g_pop = nil; g_popHSV = NULL;
-    if (!same && _host) {
-        CGRect row = [self convertRect:self.bounds toView:_host]; CGFloat pw = 220, ph = 54;
-        CGFloat x = MIN(_host.bounds.size.width - pw - 2, CGRectGetMaxX(row) - pw), y = CGRectGetMaxY(row) + 3;
-        CGFloat visBottom = [_host isKindOfClass:UIScrollView.class] ? ((UIScrollView *)_host).contentOffset.y + _host.bounds.size.height : _host.bounds.size.height;
-        if (y + ph > visBottom) y = CGRectGetMinY(row) - ph - 3;
-        UIView *pop = [[UIView alloc] initWithFrame:CGRectMake(x, y, pw, ph)];
-        pop.backgroundColor = GSC(17); pop.layer.borderColor = GSC(80).CGColor; pop.layer.borderWidth = 1;
-        GSColor *pk = [[GSColor alloc] initWithFrame:CGRectMake(8, 7, pw - 16, 40)]; pk.backgroundColor = UIColor.clearColor; pk.hsv = h;
-        pk.title = _c2 ? [NSString stringWithFormat:@"%@ - %@", _title, h == _c1 ? @"color 1 (top)" : @"color 2 (bottom)"] : [NSString stringWithFormat:@"%@ color", _title];
-        __weak GSSwatch *ws = self; pk.changed = ^{ [ws setNeedsDisplay]; };
-        [pop addSubview:pk]; [_host addSubview:pop]; [_host bringSubviewToFront:pop]; g_pop = pop; g_popHSV = h;
-    }
-    [self setNeedsDisplay];
+// ---------- действия ----------
+- (void)switched:(UISwitch*)s { [Cfg set:@(s.on) for:KeyOf(s)]; }
+- (void)slid:(UISlider*)s { [Cfg set:@(s.value) for:KeyOf(s)]; ((UILabel*)objc_getAssociatedObject(s, kLbl)).text = [NSString stringWithFormat:@"%.1f", s.value]; }
+- (void)segged:(UISegmentedControl*)m {
+    [Cfg set:@(m.selectedSegmentIndex) for:KeyOf(m)];
+    if ([KeyOf(m) isEqualToString:@"hitsound.idx"]) Snd::PlayHit((int)m.selectedSegmentIndex);   // предпрослушка
+}
+- (void)colorChanged:(UIColorWell*)w { [Cfg set:Arr(w.selectedColor) for:KeyOf(w)]; }
+- (void)cfgPick:(UIButton*)b { objc_setAssociatedObject(self, @selector(cfgLoad), KeyOf(b), OBJC_ASSOCIATION_COPY_NONATOMIC); [self rebuild]; }
+- (void)cfgLoad {
+    NSString* n = objc_getAssociatedObject(self, @selector(cfgLoad));
+    if (n && [Cfg load:n]) [self rebuild];
+}
+- (void)cfgSave {
+    UIAlertController* a = [UIAlertController alertControllerWithTitle:@"Config name" message:nil preferredStyle:UIAlertControllerStyleAlert];
+    [a addTextFieldWithConfigurationHandler:nil];
+    [a addAction:[UIAlertAction actionWithTitle:@"Save" style:UIAlertActionStyleDefault handler:^(UIAlertAction*) {
+        NSString* n = a.textFields.firstObject.text; if (n.length) { [Cfg save:n]; [self rebuild]; } }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:a animated:YES completion:nil];
 }
 @end
-static void gsSwatch(UIView *g, UIView *host, CGFloat rowY, const char *nm, float *c1, float *c2) {   // квадратики цвета справа в строке
-    CGFloat w = c2 ? 54 : 27; GSSwatch *sw = [[GSSwatch alloc] initWithFrame:CGRectMake(g.bounds.size.width - 10 - w, rowY + 4, w, 13)];
-    sw.backgroundColor = UIColor.clearColor; sw.c1 = c1; sw.c2 = c2; sw.host = host; sw.title = [NSString stringWithUTF8String:nm]; [g addSubview:sw];
-}
-static CGFloat gsColor(UIView *g, CGFloat y, const char *nm, float *hsv) {
-    GSColor *c = [[GSColor alloc] initWithFrame:CGRectMake(10, y, g.bounds.size.width - 20, 40)];
-    c.backgroundColor = UIColor.clearColor; c.hsv = hsv; c.title = [NSString stringWithUTF8String:nm]; [g addSubview:c]; return y + 43;
-}
-static CGFloat gsCombo(UIView *g, CGFloat y, const char *nm, int *p, NSArray<NSString *> *opts) {
-    GSCombo *c = [[GSCombo alloc] initWithFrame:CGRectMake(10, y, g.bounds.size.width - 20, 32)];
-    c.backgroundColor = UIColor.clearColor; c.p = p; c.opts = opts; c.title = [NSString stringWithUTF8String:nm]; [g addSubview:c]; return y + 36;
-}
-static CGFloat gsFit(UIView *g, CGFloat y) {
-    CGRect f = g.frame; f.size.height = y + 6; g.frame = f; return CGRectGetMaxY(f) + 12;
-}
-@interface GSScroll : UIScrollView @end   // страница меню с вертикальной прокруткой; слайдеры и пикеры цвета не отдают жест скроллу
-@implementation GSScroll
-- (BOOL)touchesShouldCancelInContentView:(UIView *)v { return !([v isKindOfClass:GSSlider.class] || [v isKindOfClass:GSColor.class]); }
-@end
 
-static void buildUI() {
-    UIWindow *w = keyWin(); if (!w) return; g_h = [MenuH new];
-    g_esp = [[ESPView alloc] initWithFrame:w.bounds]; g_esp.userInteractionEnabled = NO; g_esp.layer.drawsAsynchronously = YES;
-    g_esp.backgroundColor = UIColor.clearColor; g_esp.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    [w addSubview:g_esp];
-    CADisplayLink *dl = [CADisplayLink displayLinkWithTarget:g_esp selector:@selector(setNeedsDisplay)]; [dl addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
-
-    const CGFloat PW = 430, PH = 282, TAB = 74, HDR = 22, CW = PW - TAB - 14;
-    g_panel = [[UIView alloc] initWithFrame:CGRectMake(10, 38, PW, PH)];
-    g_panel.backgroundColor = GSC(10); g_panel.layer.borderColor = GSC(48).CGColor; g_panel.layer.borderWidth = 1; g_panel.hidden = YES;
-    UIView *inner = [[UIView alloc] initWithFrame:CGRectInset(g_panel.bounds, 3, 3)];
-    inner.userInteractionEnabled = NO; inner.layer.borderColor = GSC(26).CGColor; inner.layer.borderWidth = 1; [g_panel addSubview:inner];
-    CAGradientLayer *gl = [CAGradientLayer layer]; gl.frame = CGRectMake(1, 1, PW - 2, 2);
-    gl.startPoint = CGPointMake(0, 0.5); gl.endPoint = CGPointMake(1, 0.5);
-    gl.colors = @[(id)GSC(45).CGColor, (id)GSC(245).CGColor, (id)GSC(45).CGColor]; [g_panel.layer addSublayer:gl];
-    UIView *hdr = [[UIView alloc] initWithFrame:CGRectMake(0, 0, PW, HDR)];
-    UILabel *ht = [[UILabel alloc] initWithFrame:CGRectMake(12, 7, 200, 12)]; ht.text = @"vasyaware"; ht.font = gsF(9); ht.textColor = GSC(150);
-    [hdr addSubview:ht];
-    [hdr addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:g_h action:@selector(pan:)]];
-    [g_panel addSubview:hdr];
-
-    UIView *tabBg = [[UIView alloc] initWithFrame:CGRectMake(6, HDR + 2, TAB - 6, PH - HDR - 8)];
-    tabBg.backgroundColor = GSC(13); tabBg.layer.borderColor = GSC(46).CGColor; tabBg.layer.borderWidth = 1; [g_panel addSubview:tabBg];
-    NSArray *names = @[@"RAGE", @"ANTI-AIM", @"VISUALS", @"MISC", @"DEBUG"];
-    g_pages = [NSMutableArray new]; g_tabBtns = [NSMutableArray new];
-    for (int i = 0; i < (int)names.count; i++) {
-        UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom]; b.frame = CGRectMake(7, HDR + 10 + i * 28, TAB - 8, 26); b.tag = i;
-        [b setTitle:names[i] forState:UIControlStateNormal]; b.titleLabel.font = gsF(9);
-        [b addTarget:g_h action:@selector(tab:) forControlEvents:UIControlEventTouchUpInside];
-        UIView *bar = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 2, 26)]; bar.backgroundColor = GSC(245); bar.tag = 99; bar.userInteractionEnabled = NO; [b addSubview:bar];
-        [g_panel addSubview:b]; [g_tabBtns addObject:b];
-        GSScroll *pg = [[GSScroll alloc] initWithFrame:CGRectMake(TAB + 6, HDR + 8, CW, PH - HDR - 16)];
-        pg.delaysContentTouches = NO; pg.directionalLockEnabled = YES; pg.showsVerticalScrollIndicator = NO; pg.alwaysBounceHorizontal = NO;
-        [g_panel addSubview:pg]; [g_pages addObject:pg];
-    }
-
-    { // RAGE
-        UIView *pg = g_pages[0]; UIView *g = gsGroup(pg, @"aimbot", 8, CW); CGFloat y = 14;
-        y = gsCheck(g, y, "Silent Aim 360", &C.silent);
-        y = gsCheck(g, y, "Double Tap", &C.dtap);
-        y = gsCheck(g, y, "No Spread", &C.nospread);
-        gsFit(g, y);
-    }
-    { // ANTI-AIM
-        UIView *pg = g_pages[1]; UIView *g = gsGroup(pg, @"anti-aim", 8, CW); CGFloat y = 14;
-        y = gsCheck(g, y, "Enabled", &C.aa);
-        y = gsCheck(g, y, "Show on own model (camera stays)", &C.ownAA);
-        y = gsCombo(g, y, "Mode", &C.aaMode, @[@"Jitter", @"Spin", @"Static", @"Random"]);
-        y = gsSlider(g, y, "Pitch (90 = down)", &C.aaPitch, -90, 90, 5, @"%.0f°");
-        y = gsSlider(g, y, "Yaw offset", &C.aaBase, 0, 360, 5, @"%.0f°");
-        y = gsSlider(g, y, "Jitter / random range", &C.aaOff, 0, 180, 5, @"%.0f°");
-        y = gsSlider(g, y, "Spin speed", &C.aaSpin, 1, 180, 1, @"%.0f°/tick");
-        gsFit(g, y);
-    }
-    { // VISUALS
-        UIView *pg = g_pages[2]; UIView *g = gsGroup(pg, @"esp", 8, CW); CGFloat y = 14, y0;
-        y0 = y; y = gsCheck(g, y, "ESP box / nick", &C.esp); gsSwatch(g, pg, y0, "Box", C.boxTop, C.boxBot);
-        y0 = y; y = gsCheck(g, y, "HP bar", &C.hpbar);       gsSwatch(g, pg, y0, "HP bar", C.barTop, C.barBot);
-        y = gsCheck(g, y, "Glow", &C.glow);
-        y0 = y; y = gsCheck(g, y, "Lines", &C.lines); gsSwatch(g, pg, y0, "Lines", C.lineC, NULL);
-        y = gsCombo(g, y, "Line origin", &C.lineOrg, @[@"Bottom", @"Center", @"Top"]);
-        y = gsSlider(g, y, "Line width", &C.lineW, 0.5f, 5.0f, 0.5f, @"%.1f");
-        y = gsCheck(g, y, "Distance", &C.dist);
-        y0 = y; y = gsCheck(g, y, "Corner box", &C.corner); gsSwatch(g, pg, y0, "Corner", C.cnTop, C.cnBot);
-        y = gsCheck(g, y, "Weapon icon", &C.weapon);
-        y0 = y; y = gsCheck(g, y, "Off-screen arrows", &C.arrows); gsSwatch(g, pg, y0, "Arrow", C.arrC, NULL);
-        y = gsSlider(g, y, "Arrow size", &C.arrSize, 6, 20, 1, @"%.0f");
-        CGFloat ny = gsFit(g, y);
-        g = gsGroup(pg, @"crosshair", ny, CW); y = 14;
-        y0 = y; y = gsCheck(g, y, "Custom crosshair", &C.xhair); gsSwatch(g, pg, y0, "Crosshair", C.xhC, NULL);
-        y = gsCombo(g, y, "Shape", &C.xhShape, @[@"Cross", @"Dot", @"Circle", @"Square", @"X", @"Diamond"]);
-        y = gsSlider(g, y, "Size", &C.xhSize, 2, 20, 1, @"%.0f");
-        y = gsSlider(g, y, "Thickness", &C.xhThick, 0.5f, 4, 0.5f, @"%.1f");
-        y = gsSlider(g, y, "Gap (cross / X)", &C.xhGap, 0, 12, 1, @"%.0f");
-        ny = gsFit(g, y);
-        g = gsGroup(pg, @"tracers", ny, CW); y = 14;
-        y0 = y; y = gsCheck(g, y, "Bullet tracers", &C.tracers); gsSwatch(g, pg, y0, "Tracer", C.trC, NULL);
-        y = gsSlider(g, y, "Core width", &C.trW, 0.3f, 2, 0.1f, @"%.1f");
-        ny = gsFit(g, y);
-        g = gsGroup(pg, @"world", ny, CW); y = 14;
-        y0 = y; y = gsCheck(g, y, "Fog", &C.fog); gsSwatch(g, pg, y0, "Fog", C.fogC, NULL);
-        y0 = y; y = gsCheck(g, y, "Sky", &C.sky); gsSwatch(g, pg, y0, "Sky", C.skyC, NULL);
-        y = gsCheck(g, y, "Aspect ratio (stretched)", &C.aspectOn);
-        y = gsSlider(g, y, "Aspect", &C.aspect, 1.0f, 2.4f, 0.01f, @"%.2f");
-        gsFit(g, y);
-    }
-    { // MISC
-        UIView *pg = g_pages[3]; UIView *g = gsGroup(pg, @"movement", 8, CW); CGFloat y = 14;
-        y = gsCheck(g, y, "Bhop", &C.bhop);
-        y = gsSlider(g, y, "Speed multiplier", &C.bhopMul, 1.0f, 3.0f, 0.05f, @"%.2fx");
-        CGFloat ny = gsFit(g, y);
-        g = gsGroup(pg, @"feedback", ny, CW); y = 14;
-        y = gsCheck(g, y, "Hitmarker", &C.hitm);
-        y = gsCheck(g, y, "Hitsound", &C.hitsnd);
-        y = gsCheck(g, y, "Killsound", &C.killsnd);
-        y = gsCheck(g, y, "Kill message", &C.killmsg);
-        y = gsCheck(g, y, "Kill sparks", &C.sparks);
-        gsFit(g, y);
-    }
-    { // DEBUG
-        UIView *pg = g_pages[4]; UIView *g = gsGroup(pg, @"photon stream", 8, CW);
-        GSBtn *cap = [[GSBtn alloc] initWithFrame:CGRectMake(10, 14, 150, 22)]; cap.backgroundColor = UIColor.clearColor;
-        cap.title = @"capture next sync"; cap.act = ^{ g_cap = true; [g_snText setString:@""]; };
-        [g addSubview:cap];
-        GSBtn *dmp = [[GSBtn alloc] initWithFrame:CGRectMake(170, 14, 150, 22)]; dmp.backgroundColor = UIColor.clearColor;
-        dmp.title = @"dump hierarchy"; dmp.act = ^{ dumpHierarchy(); };
-        [g addSubview:dmp];
-        g_snLabel = [[UILabel alloc] initWithFrame:CGRectMake(10, 44, CW - 20, 150)];
-        g_snLabel.font = [UIFont fontWithName:@"Menlo" size:8]; g_snLabel.textColor = GSC(190); g_snLabel.numberOfLines = 0;
-        g_snLabel.lineBreakMode = NSLineBreakByWordWrapping; g_snLabel.text = @"press capture and wait 1-2 sec";
-        [g addSubview:g_snLabel];
-        gsFit(g, 44 + 150);
-    }
-
-    g_mark = [[UIView alloc] initWithFrame:CGRectMake(10, 10, 150, 24)];
-    g_mark.backgroundColor = [UIColor colorWithWhite:0.04 alpha:0.92];
-    g_mark.layer.cornerRadius = 7; g_mark.layer.masksToBounds = YES;
-    g_mark.layer.borderColor = GSC(48).CGColor; g_mark.layer.borderWidth = 1;
-    g_markGrad = [CAGradientLayer layer]; g_markGrad.frame = CGRectMake(0, 0, 150, 2);
-    g_markGrad.startPoint = CGPointMake(0, 0.5); g_markGrad.endPoint = CGPointMake(1, 0.5);
-    g_markGrad.colors = @[(id)GSC(45).CGColor, (id)GSC(245).CGColor, (id)GSC(45).CGColor]; [g_mark.layer addSublayer:g_markGrad];
-    g_markLbl = [[UILabel alloc] initWithFrame:CGRectMake(11, 0, 130, 24)]; g_markLbl.userInteractionEnabled = NO; [g_mark addSubview:g_markLbl];
-    markUpdate(0);
-    [g_mark addGestureRecognizer:[[UITapGestureRecognizer alloc] initWithTarget:g_h action:@selector(tap:)]];   // тап по ватермарке открывает меню
-    [g_mark addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:g_h action:@selector(fabPan:)]];
-    CADisplayLink *ml = [CADisplayLink displayLinkWithTarget:g_h selector:@selector(markTick:)]; [ml addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
-    [w addSubview:g_panel]; [w addSubview:g_mark];
-    for (UIView *pv in g_pages) {   // высота прокрутки = низ последней группы
-        CGFloat m = 0; for (UIView *v in pv.subviews) m = MAX(m, CGRectGetMaxY(v.frame));
-        ((UIScrollView *)pv).contentSize = CGSizeMake(CW, m + 6);
-    }
-    selectTab(0);
+// ---------- запуск ----------
+static PassWindow* gWin;
+static void MenuInit() {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+        UIWindowScene* sc = nil;
+        for (UIScene* s in UIApplication.sharedApplication.connectedScenes)
+            if ([s isKindOfClass:UIWindowScene.class] && s.activationState == UISceneActivationStateForegroundActive) { sc = (UIWindowScene*)s; break; }
+        gWin = sc ? [[PassWindow alloc] initWithWindowScene:sc] : [[PassWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
+        gWin.windowLevel = UIWindowLevelAlert + 100; gWin.backgroundColor = UIColor.clearColor;
+        gWin.rootViewController = [GlassMenu new]; gWin.hidden = NO;
+    });
 }
 
+// =====================================================================
+//  ХУКИ: подмена methodPointer (MethodInfo) и записей vtable. Код не патчится, MSHook не нужен.
+//  RVA - от базы UnityFramework, только для этой сборки клиента.
+// =====================================================================
+#include <dlfcn.h>
+#include <fcntl.h>
 
-// ---------------- диагностика ----------------
-static UILabel *g_status;
-static NSMutableSet<NSString *> *g_skip;
-static int g_okN, g_totN;
-static NSMutableString *g_fails;
-static NSString *docPath(NSString *n) { return [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject stringByAppendingPathComponent:n]; }
-static void writeState(NSString *t) { [t writeToFile:docPath(@"cm_state.txt") atomically:YES encoding:NSUTF8StringEncoding error:nil]; }
-static void showStatus(NSString *t) { if (g_status) g_status.text = t; NSLog(@"[CM] %@", t); }
-static void report() { showStatus([NSString stringWithFormat:@"patched %d/%d %@", g_okN, g_totN, g_fails.length ? [@"FAIL: " stringByAppendingString:g_fails] : @"ok"]); }
-static void fail(const char *tag, NSString *why) { [g_fails appendFormat:@"%s(%@) ", tag, why]; NSLog(@"[CM] FAIL %s: %@", tag, why); }
-
-// подмена methodPointer у MethodInfo (Unity вызывает Update/Start/... через runtime_invoke)
-static bool patchMI(const char *tag, void *mi, uintptr_t rva, void *rep) {
-    if ([g_skip containsObject:[NSString stringWithUTF8String:tag]]) { NSLog(@"[CM] skip %s", tag); return false; }
-    g_totN++;
-    if (!mi) { fail(tag, @"no method"); return false; }
-    void *cur = *(void **)mi;
-    if (rva ? ((uintptr_t)cur != B + rva) : (!cur || (uintptr_t)cur < B || (uintptr_t)cur - B > 0x9000000)) { fail(tag, @"ptr mismatch"); return false; }
-    if (origOf(mi)) { g_totN--; return true; }
-    writeState([NSString stringWithFormat:@"crash-at:%s", tag]);
-    regOrig(mi, cur);
-    *(void **)mi = rep;
-    g_okN++;
-    writeState([NSString stringWithFormat:@"ok:%d/%d last=%s", g_okN, g_totN, tag]);
-    return true;
+static NSString* DocPath(NSString* n) {
+    return [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject stringByAppendingPathComponent:n];
 }
-// подмена записи в vtable класса (виртуальные и интерфейсные вызовы)
-static bool patchVT(const char *tag, void *klass, void *mi, uintptr_t rva, void *rep) {
-    if ([g_skip containsObject:[NSString stringWithUTF8String:tag]]) { NSLog(@"[CM] skip %s", tag); return false; }
-    g_totN++;
-    if (!klass || !mi) { fail(tag, @"no class/method"); return false; }
-    uintptr_t want = B + rva, base = (uintptr_t)klass; int n = 0;
-    writeState([NSString stringWithFormat:@"crash-at:%s", tag]);
-    for (uintptr_t off = 0x100; off < 0x1000; off += 8) {
-        uintptr_t *p = (uintptr_t *)(base + off);
-        if (p[0] == (uintptr_t)mi && p[-1] == want) {
-            if (!origOf(mi)) regOrig(mi, (void *)want);
-            p[-1] = (uintptr_t)rep; n++;
-        }
-    }
-    if (!n) { fail(tag, @"vtable entry not found"); return false; }
-    g_okN++;
-    writeState([NSString stringWithFormat:@"ok:%d/%d last=%s x%d", g_okN, g_totN, tag, n]);
-    return true;
+static void Log(NSString* s) {      // Documents/log.txt, открывается через приложение "Файлы"
+    NSLog(@"[SW] %@", s);
+    NSString* p = DocPath(@"log.txt"); NSString* line = [s stringByAppendingString:@"\n"];
+    NSFileHandle* h = [NSFileHandle fileHandleForWritingAtPath:p];
+    if (!h) { [line writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil]; return; }
+    [h seekToEndOfFile]; [h writeData:[line dataUsingEncoding:NSUTF8StringEncoding]]; [h closeFile];
 }
 
-// ---------------- il2cpp API ----------------
-static void *(*il_domain_get)(void);
-static void **(*il_domain_get_assemblies)(void *, size_t *);
-static void *(*il_assembly_get_image)(void *);
-static const char *(*il_image_get_name)(void *);
-static uint32_t (*il_image_get_class_count)(void *);
-static void *(*il_image_get_class)(void *, uint32_t);
-static void *(*il_class_from_name)(void *, const char *, const char *);
-static void *(*il_class_get_method)(void *, const char *, int);
-static void *(*il_class_get_parent)(void *);
+// ---------- il2cpp API ----------
+static void*  (*il_domain_get)(void);
+static void** (*il_domain_get_assemblies)(void*, size_t*);
+static void*  (*il_assembly_get_image)(void*);
+static const char* (*il_image_get_name)(void*);
+static uint32_t (*il_image_get_class_count)(void*);
+static void*  (*il_image_get_class)(void*, uint32_t);
+static void*  (*il_class_get_method)(void*, const char*, int);
+static const char* (*il_class_get_name)(void*);
 
-static void *findImage(const char *sub) {
-    size_t n = 0; void **as = il_domain_get_assemblies(il_domain_get(), &n);
+static void* FindImage(const char* sub) {
+    size_t n = 0; void** as = il_domain_get_assemblies(il_domain_get(), &n);
     for (size_t i = 0; i < n; i++) {
-        void *img = il_assembly_get_image(as[i]); const char *nm = img ? il_image_get_name(img) : NULL;
+        void* img = il_assembly_get_image(as[i]); const char* nm = img ? il_image_get_name(img) : NULL;
         if (nm && strstr(nm, sub)) return img;
     }
     return NULL;
 }
-
-static void *findClassAny(const char *cls) {
-    size_t n = 0; void **as = il_domain_get_assemblies(il_domain_get(), &n);
-    const char *nss[] = {"Photon.Pun", "", "Photon.Realtime"};
-    for (size_t i = 0; i < n; i++) {
-        void *img = il_assembly_get_image(as[i]); if (!img) continue;
-        for (const char *ns : nss) { void *k = il_class_from_name(img, ns, cls); if (k) return k; }
+// Ищем класс по имени во ВСЕХ сборках (раньше брали первую сборку с "Assembly-CSharp" в имени -
+// это мог быть Assembly-CSharp-firstpass, где игровых классов нет).
+static void* FindClass(void* /*img*/, const char* name) {
+    size_t n = 0; void** as = il_domain_get_assemblies(il_domain_get(), &n);
+    for (size_t j = 0; j < n; j++) {
+        void* img = il_assembly_get_image(as[j]); if (!img) continue;
+        uint32_t cnt = il_image_get_class_count(img);
+        for (uint32_t i = 0; i < cnt; i++) {
+            void* k = il_image_get_class(img, i); const char* nm = k ? il_class_get_name(k) : NULL;
+            if (nm && !strcmp(nm, name)) return k;
+        }
     }
     return NULL;
 }
-
-static void installPatches() {
-    void *img = findImage("Assembly-CSharp");
-    if (!img) { fail("image", @"Assembly-CSharp not found"); report(); return; }
-    void *cm = il_class_from_name(img, "", "CharacterMotor");
-    void *dr = il_class_from_name(img, "", "DamageReciver2");
-    void *bb = il_class_from_name(img, "", "BaseBulletScript");
-    if (!cm || !dr || !bb) { fail("class", @"class not found"); report(); return; }
-
-    patchMI("CM.Start",   il_class_get_method(cm, "Start", 0),     RVA_CM_Start,     (void *)h_Start);      report();
-    patchMI("CM.Destroy", il_class_get_method(cm, "OnDestroy", 0), RVA_CM_OnDestroy, (void *)h_Destroy);    report();
-    patchMI("CM.Update",  il_class_get_method(cm, "Update", 0),    RVA_CM_Update,    (void *)h_Update);     report();
-    g_hasLate = patchMI("CM.Late", il_class_get_method(cm, "LateUpdate", 0), 0, (void *)h_Late); report();
-    patchVT("DR.Damage",  dr, il_class_get_method(dr, "Damage", 2), RVA_DR_Damage,   (void *)h_Damage);     report();
-    patchVT("CM.Serialize", cm, il_class_get_method(cm, "OnPhotonSerializeView", 2), RVA_CM_Serialize, (void *)h_Ser); report();
-    { void *ps = findClassAny("PhotonStream"); patchMI("PS.SendNext", ps ? il_class_get_method(ps, "SendNext", 1) : NULL, RVA_PS_SendNext, (void *)h_SendNext); report(); }
-
-    patchMI("BUL.Update", il_class_get_method(bb, "Update", 0), 0x3DC0188, (void *)h_BulUpdate);
-    uint32_t cnt = il_image_get_class_count(img); int sub = 0;
-    for (uint32_t i = 0; i < cnt; i++) {
-        void *k = il_image_get_class(img, i); void *p = k; bool isB = false;
-        for (int d = 0; d < 12 && p; d++) { p = il_class_get_parent(p); if (p == bb) { isB = true; break; } }
-        if (!isB) continue;
-        void *mi = il_class_get_method(k, "Update", 0);
-        if (mi && !origOf(mi)) { char tag[32]; snprintf(tag, sizeof tag, "BUL.sub%d", sub++); patchMI(tag, mi, 0, (void *)h_BulUpdate); }
-    }
-    report();
-}
-
-// ---------------- managed-обёртки (методы Unity берём из метаданных игры) ----------------
-static void *coreImg, *camKlass;
-static void *(*il_array_new)(void *, uintptr_t);
-struct MM { void *fn, *mi; };
-static MM m_gtr, m_gpos, m_grot, m_srot, m_look, m_w2s, m_main, m_sw, m_sh, m_fog, m_fogMode, m_fogDens, m_fogCol, m_sky, m_clear, m_bg, m_allCnt, m_getAll, m_enabled, m_targetTex, m_childCnt, m_getChild, m_parent, m_name, m_glrot, m_slrot, m_setAsp, m_resetAsp;
-static bool mgd(const char *ns, const char *cls, const char *meth, int argc, MM *out) {
-    if (!coreImg) return false;
-    void *k = il_class_from_name(coreImg, ns, cls); if (!k) return false;
-    void *x = il_class_get_method(k, meth, argc); if (!x) return false;
-    out->mi = x; out->fn = *(void **)x; return out->fn != NULL;
-}
-static void *w_gtr(void *c) { return ((void *(*)(void *, void *))m_gtr.fn)(c, m_gtr.mi); }
-static void w_gpos(void *t, Vec3 *o) { *o = ((Vec3 (*)(void *, void *))m_gpos.fn)(t, m_gpos.mi); }
-static void w_grot(void *t, Quat *o) { *o = ((Quat (*)(void *, void *))m_grot.fn)(t, m_grot.mi); }
-static void w_srot(void *t, Quat *q) { ((void (*)(void *, Quat, void *))m_srot.fn)(t, *q, m_srot.mi); }
-static void w_look(Vec3 *f, Vec3 *u, Quat *o) { *o = ((Quat (*)(Vec3, Vec3, void *))m_look.fn)(*f, *u, m_look.mi); }
-static void w_w2s(void *cam, Vec3 *p, int eye, Vec3 *o) { *o = ((Vec3 (*)(void *, Vec3, void *))m_w2s.fn)(cam, *p, m_w2s.mi); }
-static void *w_main(void) { return ((void *(*)(void *))m_main.fn)(m_main.mi); }
-static int w_sw(void) { return ((int (*)(void *))m_sw.fn)(m_sw.mi); }
-static int w_sh(void) { return ((int (*)(void *))m_sh.fn)(m_sh.mi); }
-static void w_fog(bool b) { ((void (*)(bool, void *))m_fog.fn)(b, m_fog.mi); }
-static void w_fogMode(int m) { ((void (*)(int, void *))m_fogMode.fn)(m, m_fogMode.mi); }
-static void w_fogDens(float d) { ((void (*)(float, void *))m_fogDens.fn)(d, m_fogDens.mi); }
-static void w_fogCol(Col *c) { ((void (*)(Col, void *))m_fogCol.fn)(*c, m_fogCol.mi); }
-static void w_sky(void *m) { ((void (*)(void *, void *))m_sky.fn)(m, m_sky.mi); }
-static void w_clear(void *cam, int f) { ((void (*)(void *, int, void *))m_clear.fn)(cam, f, m_clear.mi); }
-static void w_setAsp(void *cam, float a) { ((void (*)(void *, float, void *))m_setAsp.fn)(cam, a, m_setAsp.mi); }
-static void w_resetAsp(void *cam) { ((void (*)(void *, void *))m_resetAsp.fn)(cam, m_resetAsp.mi); }
-static void w_bg(void *cam, Col *c) { ((void (*)(void *, Col, void *))m_bg.fn)(cam, *c, m_bg.mi); }
-
-static int w_childCnt(void *t) { return ((int (*)(void *, void *))m_childCnt.fn)(t, m_childCnt.mi); }
-static void *w_getChild(void *t, int i) { return ((void *(*)(void *, int, void *))m_getChild.fn)(t, i, m_getChild.mi); }
-static void *w_parent(void *t) { return ((void *(*)(void *, void *))m_parent.fn)(t, m_parent.mi); }
-static Quat w_glr(void *t) { return ((Quat (*)(void *, void *))m_glrot.fn)(t, m_glrot.mi); }
-static void w_slr(void *t, Quat q) { ((void (*)(void *, Quat, void *))m_slrot.fn)(t, q, m_slrot.mi); }
-static NSString *objName(void *o) { return (m_name.fn && o) ? il2cppStr(((void *(*)(void *, void *))m_name.fn)(o, m_name.mi)) : @"?"; }
-
-// ---------- хелперы иерархии ----------
-static bool ssApiOK() { return m_childCnt.fn && m_getChild.fn && m_glrot.fn && m_slrot.fn && m_parent.fn && Comp_get_tr; }
-static bool ssHasCam(void *c, void *camTr) {   // камера лежит внутри этого трансформа?
-    void *t = camTr; for (int d = 0; d < 16 && t; d++) { if (t == c) return true; t = w_parent(t); } return false;
-}
-static bool g_ssActive; static void *g_ssRoot; static void *g_ssKid[16]; static Quat g_ssBase[16]; static int g_ssN;
-static double g_ssT; static float g_ownSpin;
-static void ssRestore() {
-    for (int i = 0; i < g_ssN; i++) if (g_ssKid[i]) w_slr(g_ssKid[i], g_ssBase[i]);
-    g_ssActive = false; g_ssN = 0; g_ssRoot = NULL;
-}
-// показываем на своей модели тот же yaw/pitch, что уходит по сети (камера не крутится)
-static void applyOwnAA(void *root) {
-    if (!ssApiOK()) return;
-    if (!(C.aa && C.ownAA)) { if (g_ssActive) ssRestore(); g_ssT = 0; return; }
-    void *rt = Comp_get_tr(root); if (!rt) return;
-    double now = CACurrentMediaTime(); float dt = g_ssT > 0 ? (float)(now - g_ssT) : 0; g_ssT = now; if (dt > 0.1f) dt = 0.1f;
-    float yaw;
-    if (C.aaMode == 1) { g_ownSpin = fmodf(g_ownSpin + C.aaSpin * g_serRate * dt, 360.f); yaw = C.aaBase + g_ownSpin; }   // спин плавно, как у других
-    else yaw = g_aaLastYaw;
-    int n = w_childCnt(rt); if (n > 16) n = 16; if (n <= 0) return;
-    if (g_ssRoot != rt || g_ssN != n) {   // (пере)захват базовых поворотов
-        void *nk[16]; Quat nb[16];
-        for (int i = 0; i < n; i++) {
-            void *c = w_getChild(rt, i); nk[i] = c; nb[i] = c ? w_glr(c) : (Quat){0, 0, 0, 1};
-            if (g_ssRoot == rt) for (int j = 0; j < g_ssN; j++) if (g_ssKid[j] == c) nb[i] = g_ssBase[j];
+// Диагностика: какие сборки есть, сколько в них классов, и какие классы похожи на нужные
+static void DumpDiag() {
+    size_t n = 0; void** as = il_domain_get_assemblies(il_domain_get(), &n);
+    Log([NSString stringWithFormat:@"assemblies: %zu", n]);
+    int shown = 0;
+    for (size_t j = 0; j < n; j++) {
+        void* img = il_assembly_get_image(as[j]); if (!img) continue;
+        uint32_t cnt = il_image_get_class_count(img);
+        const char* in = il_image_get_name(img);
+        if (cnt > 200 || (in && strstr(in, "Assembly"))) Log([NSString stringWithFormat:@"  %s: %u классов", in ? in : "?", cnt]);
+        for (uint32_t i = 0; i < cnt && shown < 40; i++) {
+            void* k = il_image_get_class(img, i); const char* nm = k ? il_class_get_name(k) : NULL;
+            if (nm && (strstr(nm, "Player") || strstr(nm, "Weapon") || strstr(nm, "Gun") || strstr(nm, "Hit")) && in && !strstr(in, "UnityEngine") && !strstr(in, "Photon")) {
+                Log([NSString stringWithFormat:@"  class %s (%s)", nm, in]); shown++;
+            }
         }
-        memcpy(g_ssKid, nk, sizeof(void *) * n); memcpy(g_ssBase, nb, sizeof(Quat) * n); g_ssN = n; g_ssRoot = rt;
-    }
-    void *cam = pickCamera(); void *camTr = cam ? Comp_get_tr(cam) : NULL;
-    float ya = yaw * (float)M_PI / 180.f, pa = C.aaPitch * (float)M_PI / 180.f;
-    Quat qy = {0, sinf(ya / 2), 0, cosf(ya / 2)}, qx = {sinf(pa / 2), 0, 0, cosf(pa / 2)};
-    for (int i = 0; i < n; i++) {
-        void *c = g_ssKid[i]; if (!c) continue;
-        if (camTr && ssHasCam(c, camTr)) continue;   // ветку с камерой не трогаем
-        w_slr(c, qmul(qy, qmul(g_ssBase[i], qx)));
-    }
-    g_ssActive = true;
-}
-static void dumpHierarchy() {
-    [g_snText setString:@""];
-    if (!g_local || !ssApiOK()) { [g_snText appendString:@"no local player or Transform API missing"]; return; }
-    void *rt = Comp_get_tr(g_local); void *cam = pickCamera(); void *camTr = cam ? Comp_get_tr(cam) : NULL;
-    int n = w_childCnt(rt);
-    [g_snText appendFormat:@"root=%@ kids=%d cam=%d camInRoot=%d\n", objName(rt), n, camTr != NULL, camTr && ssHasCam(rt, camTr)];
-    for (int i = 0; i < n && i < 16; i++) {
-        void *c = w_getChild(rt, i);
-        [g_snText appendFormat:@"%d:%@ cam=%d  |  ", i, objName(c), camTr && c && ssHasCam(c, camTr)];
     }
 }
 
-static void *pickCamera() {
-    static void *cached; static double cachedT;
-    void *c = Cam_main ? Cam_main() : NULL; if (c) return c;
-    double now = CACurrentMediaTime();
-    if (cached && now - cachedT < 0.5) return cached;
-    cachedT = now; cached = NULL;
-    if (!m_allCnt.fn || !m_getAll.fn || !il_array_new || !camKlass) return NULL;
-    int n = ((int (*)(void *))m_allCnt.fn)(m_allCnt.mi); if (n <= 0 || n > 16) return NULL;
-    void *arr = il_array_new(camKlass, n); if (!arr) return NULL;
-    ((int (*)(void *, void *))m_getAll.fn)(arr, m_getAll.mi);
-    for (int i = 0; i < n; i++) {
-        void *cam = ((void **)((uintptr_t)arr + 0x20))[i]; if (!cam) continue;
-        bool en = m_enabled.fn ? ((bool (*)(void *, void *))m_enabled.fn)(cam, m_enabled.mi) : true;
-        void *tt = m_targetTex.fn ? ((void *(*)(void *, void *))m_targetTex.fn)(cam, m_targetTex.mi) : NULL;
-        if (en && !tt) { cached = cam; break; }
-    }
-    return cached;
-}
+// ---------- реестр оригиналов ----------
+struct OrigE { void* mi; void* fn; };
+static OrigE g_orig[96]; static int g_nOrig;
+static void  regOrig(void* mi, void* fn) { if (g_nOrig < 96) g_orig[g_nOrig++] = { mi, fn }; }
+static void* origOf(void* mi) { for (int i = 0; i < g_nOrig; i++) if (g_orig[i].mi == mi) return g_orig[i].fn; return NULL; }
 
-// ---------------- инициализация ----------------
-static void setup() {
-    B = getBase("UnityFramework");
-    void *h = dlopen(NULL, RTLD_NOW);
-#define SYM(v, n) v = (decltype(v))dlsym(h, n)
-    SYM(resolve_icall, "il2cpp_resolve_icall");
-    SYM(il_domain_get, "il2cpp_domain_get"); SYM(il_domain_get_assemblies, "il2cpp_domain_get_assemblies");
-    SYM(il_assembly_get_image, "il2cpp_assembly_get_image"); SYM(il_image_get_name, "il2cpp_image_get_name");
-    SYM(il_image_get_class_count, "il2cpp_image_get_class_count"); SYM(il_image_get_class, "il2cpp_image_get_class");
-    SYM(il_class_from_name, "il2cpp_class_from_name"); SYM(il_class_get_method, "il2cpp_class_get_method_from_name");
-    SYM(il_class_get_parent, "il2cpp_class_get_parent");
-    SYM(il2cpp_object_get_class, "il2cpp_object_get_class"); SYM(il2cpp_class_get_name, "il2cpp_class_get_name");
-    if (!B || !resolve_icall || !il_domain_get) {
-        NSLog(@"[CM] base/il2cpp api not found, retry");
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{ setup(); });
-        return;
-    }
-    g_players = [NSMutableSet new]; g_fails = [NSMutableString new]; g_snText = [NSMutableString new]; g_aliveMap = [NSMutableDictionary new]; initSounds();
-    coreImg = findImage("UnityEngine.CoreModule");
-    SYM(il_array_new, "il2cpp_array_new");
-    camKlass = coreImg ? il_class_from_name(coreImg, "UnityEngine", "Camera") : NULL;
-    NSMutableString *api = [NSMutableString stringWithFormat:@"core:%d ", coreImg != NULL];
-#define API(var, wrapper, mm, ns, cls, meth, argc, icname, tag) \
-    do { if (mgd(ns, cls, meth, argc, &mm)) { var = (decltype(var))wrapper; [api appendString:@tag ":M "]; } \
-         else { ICALL(var, icname); [api appendString:var ? @tag ":i " : @tag ":X "]; } } while (0)
-    API(Cam_main,    w_main,   m_main,    "UnityEngine", "Camera",         "get_main", 0, "UnityEngine.Camera::get_main()", "main");
-    API(Comp_get_tr, w_gtr,    m_gtr,     "UnityEngine", "Component",      "get_transform", 0, "UnityEngine.Component::get_transform()", "tr");
-    API(Tr_get_pos,  w_gpos,   m_gpos,    "UnityEngine", "Transform",      "get_position", 0, "UnityEngine.Transform::get_position_Injected(UnityEngine.Vector3&)", "pos");
-    API(Tr_get_rot,  w_grot,   m_grot,    "UnityEngine", "Transform",      "get_rotation", 0, "UnityEngine.Transform::get_rotation_Injected(UnityEngine.Quaternion&)", "rot");
-    API(Tr_set_rot,  w_srot,   m_srot,    "UnityEngine", "Transform",      "set_rotation", 1, "UnityEngine.Transform::set_rotation_Injected(UnityEngine.Quaternion&)", "srot");
-    API(Quat_Look,   w_look,   m_look,    "UnityEngine", "Quaternion",     "LookRotation", 2, "UnityEngine.Quaternion::LookRotation_Injected(UnityEngine.Vector3&,UnityEngine.Vector3&,UnityEngine.Quaternion&)", "look");
-    API(Cam_w2s,     w_w2s,    m_w2s,     "UnityEngine", "Camera",         "WorldToScreenPoint", 1, "UnityEngine.Camera::WorldToScreenPoint_Injected(UnityEngine.Vector3&,UnityEngine.Camera/MonoOrStereoscopicEye,UnityEngine.Vector3&)", "w2s");
-    API(Scr_w,       w_sw,     m_sw,      "UnityEngine", "Screen",         "get_width", 0, "UnityEngine.Screen::get_width()", "sw");
-    API(Scr_h,       w_sh,     m_sh,      "UnityEngine", "Screen",         "get_height", 0, "UnityEngine.Screen::get_height()", "sh");
-    API(RS_fog,      w_fog,    m_fog,     "UnityEngine", "RenderSettings", "set_fog", 1, "UnityEngine.RenderSettings::set_fog(System.Boolean)", "fog");
-    API(RS_fogMode,  w_fogMode,m_fogMode, "UnityEngine", "RenderSettings", "set_fogMode", 1, "UnityEngine.RenderSettings::set_fogMode(UnityEngine.FogMode)", "fmode");
-    API(RS_fogDens,  w_fogDens,m_fogDens, "UnityEngine", "RenderSettings", "set_fogDensity", 1, "UnityEngine.RenderSettings::set_fogDensity(System.Single)", "fdens");
-    API(RS_fogCol,   w_fogCol, m_fogCol,  "UnityEngine", "RenderSettings", "set_fogColor", 1, "UnityEngine.RenderSettings::set_fogColor_Injected(UnityEngine.Color&)", "fcol");
-    API(RS_skybox,   w_sky,    m_sky,     "UnityEngine", "RenderSettings", "set_skybox", 1, "UnityEngine.RenderSettings::set_skybox(UnityEngine.Material)", "sky");
-    API(Cam_clear,   w_clear,  m_clear,   "UnityEngine", "Camera",         "set_clearFlags", 1, "UnityEngine.Camera::set_clearFlags(UnityEngine.CameraClearFlags)", "clr");
-    API(Cam_bg,      w_bg,     m_bg,      "UnityEngine", "Camera",         "set_backgroundColor", 1, "UnityEngine.Camera::set_backgroundColor_Injected(UnityEngine.Color&)", "bg");
-    API(Cam_setAsp,  w_setAsp, m_setAsp,  "UnityEngine", "Camera",         "set_aspect", 1, "UnityEngine.Camera::set_aspect(System.Single)", "asp");
-    API(Cam_resetAsp,w_resetAsp,m_resetAsp,"UnityEngine","Camera",         "ResetAspect", 0, "UnityEngine.Camera::ResetAspect()", "rasp");
-    mgd("UnityEngine", "Camera", "get_allCamerasCount", 0, &m_allCnt);
-    mgd("UnityEngine", "Camera", "GetAllCameras", 1, &m_getAll);
-    mgd("UnityEngine", "Behaviour", "get_enabled", 0, &m_enabled);
-    mgd("UnityEngine", "Camera", "get_targetTexture", 0, &m_targetTex);
-    mgd("UnityEngine", "Transform", "get_childCount", 0, &m_childCnt);
-    mgd("UnityEngine", "Transform", "GetChild", 1, &m_getChild);
-    mgd("UnityEngine", "Transform", "get_parent", 0, &m_parent);
-    mgd("UnityEngine", "Object", "get_name", 0, &m_name);
-    mgd("UnityEngine", "Transform", "get_localRotation", 0, &m_glrot);
-    mgd("UnityEngine", "Transform", "set_localRotation", 1, &m_slrot);
-    NSLog(@"[CM] api %@", api);
-
-    NSString *prevBc = [[NSString stringWithContentsOfFile:docPath(@"cm_bc.txt") encoding:NSUTF8StringEncoding error:nil] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-    g_bcFd = open([docPath(@"cm_bc.txt") fileSystemRepresentation], O_RDWR | O_CREAT, 0644);
-    NSString *prev = [NSString stringWithContentsOfFile:docPath(@"cm_state.txt") encoding:NSUTF8StringEncoding error:nil];
+// ---------- защита от краша: если упали на патче, при следующем запуске он пропускается ----------
+static NSMutableSet<NSString*>* g_skip;
+static void WriteState(NSString* t) { [t writeToFile:DocPath(@"sw_state.txt") atomically:YES encoding:NSUTF8StringEncoding error:nil]; }
+static void LoadSkip() {
     g_skip = [NSMutableSet set];
-    for (NSString *l in [[NSString stringWithContentsOfFile:docPath(@"cm_skip.txt") encoding:NSUTF8StringEncoding error:nil] componentsSeparatedByString:@"\n"])
+    for (NSString* l in [[NSString stringWithContentsOfFile:DocPath(@"sw_skip.txt") encoding:NSUTF8StringEncoding error:nil] componentsSeparatedByString:@"\n"])
         if (l.length) [g_skip addObject:l];
+    NSString* prev = [NSString stringWithContentsOfFile:DocPath(@"sw_state.txt") encoding:NSUTF8StringEncoding error:nil];
     if ([prev hasPrefix:@"crash-at:"]) {
         [g_skip addObject:[prev substringFromIndex:9]];
-        [[g_skip.allObjects componentsJoinedByString:@"\n"] writeToFile:docPath(@"cm_skip.txt") atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        [[g_skip.allObjects componentsJoinedByString:@"\n"] writeToFile:DocPath(@"sw_skip.txt") atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        Log([NSString stringWithFormat:@"prev launch crashed at %@ -> skipped", [prev substringFromIndex:9]]);
     }
-    buildUI();
-    UIWindow *w = keyWin();
-    g_status = [[UILabel alloc] initWithFrame:CGRectMake(60, w.bounds.size.height - 48, 330, 16)];
-    g_status.textColor = UIColor.yellowColor; g_status.font = [UIFont boldSystemFontOfSize:11]; g_status.userInteractionEnabled = NO;
-    if (prev.length) showStatus([NSString stringWithFormat:@"prev: %@ | bc: %@ | skip: %@", prev, prevBc, [g_skip.allObjects componentsJoinedByString:@","]]);
-    UILabel *dbg = [[UILabel alloc] initWithFrame:CGRectMake(60, w.bounds.size.height - 32, 420, 30)];
-    dbg.textColor = UIColor.cyanColor; dbg.font = [UIFont boldSystemFontOfSize:10]; dbg.numberOfLines = 3; dbg.userInteractionEnabled = NO;
-    dbg.text = api;
-    [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *t) {
-        NSUInteger np; @synchronized (g_players) { np = g_players.count; }
-        if (g_snLabel) g_snLabel.text = g_snText.length ? g_snText : @"press capture and wait 1-2 sec";
-        dbg.text = [NSString stringWithFormat:@"%@\ncam=%d local=%d players=%lu target=%d", api, pickCamera() != NULL, g_local != NULL, (unsigned long)np, g_hasTarget];
-    }];
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 4 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{ installPatches(); });
 }
 
-__attribute__((constructor)) static void init() {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 8 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{ setup(); });
+// MethodInfo.methodPointer = первое поле. Работает для вызовов через runtime_invoke (RPC, Update/Start и т.п.)
+static bool PatchMI(const char* tag, void* mi, uintptr_t rva, void* rep, NSString** why) {
+    void* cur = *(void**)mi;
+    if ((uintptr_t)cur != G::base + rva) { *why = @"ptr mismatch"; return false; }
+    if (origOf(mi)) return true;
+    WriteState([NSString stringWithFormat:@"crash-at:%s", tag]);
+    regOrig(mi, cur);
+    *(void**)mi = rep;
+    WriteState([NSString stringWithFormat:@"ok:%s", tag]);
+    return true;
+}
+// Запись vtable: VirtualInvokeData {methodPtr, method}. Нужна для виртуальных/интерфейсных вызовов.
+// Класс должен быть уже проинициализирован (vtable заполнена), поэтому ставим с повторами.
+static bool PatchVT(const char* tag, void* klass, void* mi, uintptr_t rva, void* rep, NSString** why) {
+    uintptr_t want = G::base + rva, base = (uintptr_t)klass; int n = 0;
+    WriteState([NSString stringWithFormat:@"crash-at:%s", tag]);
+    for (uintptr_t off = 0x100; off < 0x1000; off += 8) {
+        uintptr_t* p = (uintptr_t*)(base + off);
+        if (p[0] == (uintptr_t)mi && p[-1] == want) {
+            if (!origOf(mi)) regOrig(mi, (void*)want);
+            p[-1] = (uintptr_t)rep; n++;
+        }
+    }
+    WriteState([NSString stringWithFormat:@"ok:%s", tag]);
+    if (!n) { *why = @"vtable entry not found (класс ещё не инициализирован?)"; return false; }
+    return true;
+}
+
+// ---------- обработчики ----------
+// NoRecoil / NoSpread: WeaponController.HBOKJJPJPGI (virtual) -> AccuracyData {AccuracyAngle 0x10, RecoilAngle 0x14}
+typedef void* (*fn_acc_t)(void*, void*);
+static void* h_acc(void* self, void* mi) {
+    fn_acc_t o = (fn_acc_t)origOf(mi);
+    void* r = o ? o(self, mi) : NULL;
+    if (r && G::Valid((uintptr_t)r)) {
+        float* f = (float*)((uintptr_t)r + 0x10);
+        if ([Cfg b:@"nospread"]) f[0] = 0.f;
+        if ([Cfg b:@"norecoil"]) f[1] = 0.f;
+    }
+    return r;
+}
+
+// ПРОБЫ: пишут в log.txt, какой метод сработал (тумблер Misc -> Probe). MethodInfo* лежит последним аргументом,
+// поэтому ищем его среди 8 регистровых аргументов по реестру оригиналов.
+typedef void* (*fn8_t)(void*, void*, void*, void*, void*, void*, void*, void*);
+static void* FindMi(void** a) { for (int i = 0; i < 8; i++) if (a[i] && origOf(a[i])) return a[i]; return NULL; }
+#define PROBE(NAME)                                                                                   \
+    static void* h_##NAME(void* a, void* b, void* c, void* d, void* e, void* f, void* g, void* h) {   \
+        void* args[8] = { a, b, c, d, e, f, g, h }; void* mi = FindMi(args);                          \
+        if ([Cfg b:@"probe"]) Log(@"probe: " #NAME);                                                  \
+        void* o = mi ? origOf(mi) : NULL;                                                             \
+        return o ? ((fn8_t)o)(a, b, c, d, e, f, g, h) : NULL;                                         \
+    }
+PROBE(HitOverride) PROBE(MDBP) PROBE(HitViaServer)
+#undef PROBE
+
+// ---------- боевые обработчики ----------
+typedef void (*fn_v_t)(void*, void*);
+typedef void (*fn_adpg_t)(void*, void*, void*, void*);
+
+// Список игроков: вызываем оригинал и запоминаем this. Заодно тик локального игрока (bhop).
+static void h_PCUpdate(void* self, void* mi) {
+    fn_v_t o = (fn_v_t)origOf(mi); if (o) o(self, mi);
+    PS::seen[(uintptr_t)self] = CACurrentMediaTime();
+    G::lastPC = CACurrentMediaTime();
+    TickLocal((uintptr_t)self);
+}
+// Попадание по игроку (this = PlayerHitController жертвы). pp = PhotonPlayer, предположительно стрелок (?)
+static void h_ADPG(void* self, void* hit, void* pp, void* mi) {
+    fn_adpg_t o = (fn_adpg_t)origOf(mi); if (o) o(self, hit, pp, mi);
+    uintptr_t local = G::LocalPlayer(), lpp = G::Valid(local) ? G::Ptr(local + OFF::PC_PhotonPlayer) : 0;
+    bool mine = lpp && (uintptr_t)pp == lpp;
+    uintptr_t victim = G::Ptr((uintptr_t)self + OFF::HC_Player);
+    uintptr_t arr = G::Ptr((uintptr_t)hit + 0x38);                          // EKPAEOPMDOM.DJHLCPDPDAA (AMCGODIMMFF[])
+    int n = G::Valid(arr) ? G::Rd<int>(arr + 0x18) : 0; if (n > 8) n = 8;
+    float first = 0; uint8_t wid = G::Rd<uint8_t>((uintptr_t)hit + 0x28);
+    for (int i = 0; i < n; i++) {
+        uintptr_t e = G::Ptr(arr + 0x20 + 8 * i); if (i == 0) first = G::Rd<float>(e + 0x28);
+        if ([Cfg b:@"probe"]) Log([NSString stringWithFormat:@"ADPG e%d: f28=%.2f i2C=%d f30=%.2f bone=%d b38=%d", i, G::Rd<float>(e + 0x28), G::Rd<int>(e + 0x2C), G::Rd<float>(e + 0x30), G::Rd<int>(e + 0x34), G::Rd<uint8_t>(e + 0x38)]);
+    }
+    if ([Cfg b:@"probe"]) Log([NSString stringWithFormat:@"probe: ADPG mine=%d victim=%p n=%d", mine, (void*)victim, n]);
+    if (!mine) return;
+    if ([Cfg b:@"silent"] || [Cfg b:@"silent360"]) Log([NSString stringWithFormat:@"SILENT: моё попадание registered, victim=%p", (void*)victim]);
+    PS::lastVictim = victim; PS::lastHitT = CACurrentMediaTime();
+    NSString* nm = G::Str(G::Ptr(G::Ptr(victim + OFF::PC_PhotonPlayer) + OFF::PP_Nick));
+    EvHit(nm.length ? nm : @"?", [NSString stringWithFormat:@"[%s] %.0f", WeaponName(wid), first]);
+}
+// Смерть игрока. Убийцу не знаем -> засчитываем, если это жертва моего последнего попадания (<1.5 c)
+static void h_Die(void* self, void* mi) {
+    fn_v_t o = (fn_v_t)origOf(mi); if (o) o(self, mi);
+    if ([Cfg b:@"probe"]) Log(@"probe: DieViaServer");
+    if ((uintptr_t)self == PS::lastVictim && CACurrentMediaTime() - PS::lastHitT < 1.5) { PS::lastVictim = 0; EvKill((uintptr_t)self); }
+}
+
+
+
+// ===== Silent Aim =====
+// Все хуки тут data-only (MethodInfo / vtable): inline-хук на устройстве без JIT не поставить.
+// Выстрел считается внутри ПРИВАТНЫХ методов GunController (прямые вызовы, подменить нельзя),
+// но запускается из ВИРТУАЛЬНЫХ методов того же класса (их vtable-запись патчится).
+// Принцип как в чите для другой игры (направление правится в момент выстрела): на время такого вызова
+// поворачиваем камеру/прицел на цель, после вызова возвращаем -> на экране ничего не дёргается.
+namespace SA {
+struct Quat4 { float x, y, z, w; };
+inline Quat4 LookQ(Vec3 f) {          // эквивалент Quaternion.LookRotation(f, up)
+    float l = sqrtf(f.x*f.x + f.y*f.y + f.z*f.z); if (l < 1e-6f) return {0, 0, 0, 1};
+    f.x /= l; f.y /= l; f.z /= l;
+    Vec3 r = { f.z, 0.f, -f.x };      // cross(up, f)
+    float rl = sqrtf(r.x*r.x + r.z*r.z);
+    if (rl < 1e-5f) r = { 1.f, 0.f, 0.f }; else { r.x /= rl; r.z /= rl; }
+    Vec3 u = { f.y*r.z - f.z*r.y, f.z*r.x - f.x*r.z, f.x*r.y - f.y*r.x };   // cross(f, r)
+    float m00 = r.x, m01 = u.x, m02 = f.x, m10 = r.y, m11 = u.y, m12 = f.y, m20 = r.z, m21 = u.z, m22 = f.z;
+    float tr = m00 + m11 + m22; Quat4 q;
+    if (tr > 0)                       { float s = sqrtf(tr + 1.f) * 2.f;               q = { (m21 - m12) / s, (m02 - m20) / s, (m10 - m01) / s, 0.25f * s }; }
+    else if (m00 > m11 && m00 > m22)  { float s = sqrtf(1.f + m00 - m11 - m22) * 2.f; q = { 0.25f * s, (m01 + m10) / s, (m02 + m20) / s, (m21 - m12) / s }; }
+    else if (m11 > m22)               { float s = sqrtf(1.f + m11 - m00 - m22) * 2.f; q = { (m01 + m10) / s, 0.25f * s, (m12 + m21) / s, (m02 - m20) / s }; }
+    else                              { float s = sqrtf(1.f + m22 - m00 - m11) * 2.f; q = { (m02 + m20) / s, (m12 + m21) / s, 0.25f * s, (m10 - m01) / s }; }
+    return q;
+}
+
+struct Tgt { bool ok = false; Vec3 aim{0,0,0}; Vec3 cam{0,0,0}; uintptr_t pc = 0; float score = 0; };
+
+// Цель: враг, жив. Обычный режим - ближайший к центру экрана в пределах FOV, 360 - ближайший по расстоянию.
+inline Tgt Pick() {
+    Tgt t;
+    if (!G::InMatch() || !G::i_sw || !G::i_sh) return t;
+    uintptr_t pmc = G::PMC(); if (!G::Valid(pmc)) return t;
+    uintptr_t cam = G::Ptr(pmc + OFF::PMC_Camera), local = G::LocalPlayer();
+    if (!G::Valid(cam) || !G::Valid(local)) return t;
+    G::Pos(G::Ptr(pmc + OFF::PMC_Transform), t.cam);
+    bool all = [Cfg b:@"silent360"], swapHp = [Cfg b:@"hpswap"];
+    uint8_t lteam = G::TeamOf(local);
+    float sw = (float)G::i_sw(), sh = (float)G::i_sh(); if (sw < 1 || sh < 1) return t;
+    float fov = [Cfg f:@"silent.fov"]; if (fov < 1) fov = 1;
+    float fovPx = (sh * 0.5f) * tanf(fov * 0.0174533f) / 0.41421f;   // вертикальный FOV камеры = 45 градусов
+    if (fovPx > 1e5f) fovPx = 1e5f;
+    float best = 1e30f; double now = CACurrentMediaTime();
+    for (auto& kv : PS::seen) {
+        if (now - kv.second > 0.5) continue;
+        uintptr_t pc = kv.first; if (pc == local) continue;
+        uint8_t tm = G::TeamOf(pc); if (tm != 1 && tm != 2) continue;
+        if (lteam != 0 && tm == lteam) continue;
+        if (G::Rd<int>(pc + (swapHp ? OFF::PC_HpB : OFF::PC_HpA)) <= 0) continue;
+        uintptr_t biped = G::Ptr(pc + OFF::PC_Biped); if (!G::Valid(biped)) continue;
+        Vec3 w; if (!G::Pos(G::Ptr(biped + 0x18), w)) continue;      // 0x18 = Head
+        float score;
+        if (all) { float dx = w.x - t.cam.x, dy = w.y - t.cam.y, dz = w.z - t.cam.z; score = dx*dx + dy*dy + dz*dz; }
+        else {
+            Vec3 r; if (!G::W2SRaw(cam, w, r) || r.z <= 0.01f) continue;
+            float dx = r.x - sw * 0.5f, dy = r.y - sh * 0.5f; score = sqrtf(dx*dx + dy*dy);
+            if (score > fovPx) continue;
+        }
+        if (score < best) { best = score; t.ok = true; t.aim = w; t.pc = pc; t.score = score; }
+    }
+    return t;
+}
+
+// RAII: на время вызова оригинала камера/прицел смотрят на цель; деструктор всё возвращает (даже при исключении il2cpp)
+struct Scope {
+    struct Saved { uintptr_t t; Quat4 q; };
+    Saved s[3]; int n = 0;
+    Scope(uintptr_t gun, const char* tag) {
+        try {
+            if (![Cfg b:@"silent"] && ![Cfg b:@"silent360"]) return;
+            if (!G::i_getRot || !G::i_setRot) { static bool w; if (!w) { w = true; Log(@"silent: нет icall get/set_rotation (см. 'icall: rot' выше)"); } return; }
+            uintptr_t local = G::LocalPlayer();
+            if (!G::Valid(local) || G::Ptr(gun + OFF::WPN_Owner) != local) return;   // только оружие самого игрока
+            Tgt tg = Pick(); if (!tg.ok) return;
+            Vec3 d = { tg.aim.x - tg.cam.x, tg.aim.y - tg.cam.y, tg.aim.z - tg.cam.z };
+            Quat4 q = LookQ(d);
+            uintptr_t aim = G::Ptr(local + OFF::PC_Aim), pmc = G::PMC();
+            uintptr_t c[3] = { G::Valid(aim) ? G::Ptr(aim + OFF::AC_Cam) : 0, G::Valid(aim) ? G::Ptr(aim + OFF::AC_Fps) : 0,
+                               G::Valid(pmc) ? G::Ptr(pmc + OFF::PMC_Transform) : 0 };
+            static int logn = 0;
+            for (uintptr_t tr : c) {
+                if (!G::Valid(tr)) continue;
+                bool dup = false; for (int i = 0; i < n; i++) if (s[i].t == tr) dup = true;
+                if (dup) continue;
+                Quat4 cur; G::i_getRot((void*)tr, (float*)&cur);
+                s[n].t = tr; s[n].q = cur; n++;
+                if (logn < 8) {   // диагностика: сверка углов камеры с aimingData (для запасного варианта через углы)
+                    float fx = 2*(cur.x*cur.z + cur.w*cur.y), fy = 2*(cur.y*cur.z - cur.w*cur.x), fz = 1 - 2*(cur.x*cur.x + cur.y*cur.y);
+                    uintptr_t ad = G::Valid(aim) ? G::Ptr(aim + OFF::AC_AimData) : 0;
+                    Log([NSString stringWithFormat:@"silentdiag[%s] tr=%p yaw=%.1f pitch=%.1f | aimingData f0=%.3f f1=%.3f", tag, (void*)tr,
+                         atan2f(fx, fz) * 57.29578f, -asinf(fy) * 57.29578f, ad ? G::Rd<float>(ad + 0x10) : 0.f, ad ? G::Rd<float>(ad + 0x14) : 0.f]);
+                }
+                G::i_setRot((void*)tr, (float*)&q);
+            }
+            if (logn < 8) { logn++; Log([NSString stringWithFormat:@"silent[%s]: цель pc=%p, поворотов=%d", tag, (void*)tg.pc, n]); }
+        } catch (...) {}
+    }
+    ~Scope() { try { for (int i = n - 1; i >= 0; i--) G::i_setRot((void*)s[i].t, (float*)&s[i].q); } catch (...) {} }
+};
+}   // namespace SA
+
+typedef void (*fn_gv0_t)(void*, void*);
+typedef void (*fn_gtick_t)(void*, float, void*);
+typedef void (*fn_gin_t)(void*, void*, float, float, void*);
+// Виртуальные методы GunController, из которых может запускаться выстрел (какой именно - покажет log.txt: строки silent[...])
+static void h_GunV0(void* self, void* mi)  { fn_gv0_t o = (fn_gv0_t)origOf(mi); if (!o) return; SA::Scope s((uintptr_t)self, "v0"); o(self, mi); }
+static void h_GunTick(void* self, float dt, void* mi) { fn_gtick_t o = (fn_gtick_t)origOf(mi); if (!o) return; SA::Scope s((uintptr_t)self, "tick"); o(self, dt, mi); }
+static void h_GunInput(void* self, void* in, float t, float dt, void* mi) { fn_gin_t o = (fn_gin_t)origOf(mi); if (!o) return; SA::Scope s((uintptr_t)self, "input"); o(self, in, t, dt, mi); }
+
+// ---------- таблица патчей ----------
+struct HookDef { const char* tag; const char* cls; const char* meth; int argc; uintptr_t rva; bool vt; void* rep; bool done; };
+static HookDef g_hooks[] = {
+    { "ACC.gun",   "GunController",       "HBOKJJPJPGI", 0,  0x1913D78, true,  (void*)h_acc,           false },
+    { "ACC.base",  "WeaponController",    "HBOKJJPJPGI", 0,  0x191DE68, true,  (void*)h_acc,           false },
+    { "P.HitOv",   "PlayerHitController", "GDDPDFEGECG", 2,  0x1AA3440, true,  (void*)h_HitOverride,   false },
+    { "P.Upd",     "PlayerController",    "Update",       0,  0x1AB01B0, false, (void*)h_PCUpdate,      false },
+    { "P.ADPG",    "PlayerHitController", "ADPGMPBILJE", 2,  0x1AA2DC4, true,  (void*)h_ADPG,          false },
+    { "P.MDBP",    "PlayerHitController", "MDBPFBOOPGP", 2,  0x1AA3E30, true,  (void*)h_MDBP,          false },
+    { "P.HitVS",   "PlayerHitController", "HitViaServer", 5, 0x1AA2B84, false, (void*)h_HitViaServer,  false },
+    { "P.Die",     "PlayerController",    "DieViaServer", 0,  0x1AAE87C, false, (void*)h_Die,           false },
+    { "GUN.Input", "GunController",       "DANAHKIIPHK", 3,  0x190E338, true,  (void*)h_GunInput,      false },
+    { "GUN.Tick",  "GunController",       "CCDAKKENGBH", 1,  0x1914044, true,  (void*)h_GunTick,       false },
+    { "GUN.V13",   "GunController",       "ELEOJFHKLDC", 0,  0x1911EB4, true,  (void*)h_GunV0,         false },
+    { "GUN.V11",   "GunController",       "LCIFHNLNDNE", 0,  0x1912FB0, true,  (void*)h_GunV0,         false },
+};
+static const int kHooks = sizeof(g_hooks) / sizeof(g_hooks[0]);
+static int g_attempt;
+
+static void TryInstall() {
+    g_attempt++;
+    if (!il_domain_get) {
+        void* h = dlopen(NULL, RTLD_NOW);
+#define SYM(v, n) v = (decltype(v))dlsym(h, n)
+        SYM(il_domain_get, "il2cpp_domain_get"); SYM(il_domain_get_assemblies, "il2cpp_domain_get_assemblies");
+        SYM(il_assembly_get_image, "il2cpp_assembly_get_image"); SYM(il_image_get_name, "il2cpp_image_get_name");
+        SYM(il_image_get_class_count, "il2cpp_image_get_class_count"); SYM(il_image_get_class, "il2cpp_image_get_class");
+        SYM(il_class_get_method, "il2cpp_class_get_method_from_name"); SYM(il_class_get_name, "il2cpp_class_get_name");
+#undef SYM
+    }
+    G::Init();
+    void* img = (G::base && il_domain_get && il_class_get_name) ? FindImage("Assembly-CSharp") : NULL;
+    if (!img) { if (g_attempt == 1) Log(@"il2cpp API / Assembly-CSharp не найдены, повторю"); goto again; }
+    if (g_attempt == 1 || g_attempt == 6) DumpDiag();
+    {
+        int left = 0;
+        for (int i = 0; i < kHooks; i++) {
+            HookDef& H = g_hooks[i]; if (H.done) continue;
+            if ([g_skip containsObject:[NSString stringWithUTF8String:H.tag]]) { H.done = true; Log([NSString stringWithFormat:@"skip %s", H.tag]); continue; }
+            NSString* why = nil;
+            void* k = FindClass(img, H.cls);
+            void* mi = k ? il_class_get_method(k, H.meth, H.argc) : NULL;
+            bool ok = false;
+            if (!k) why = @"class not found"; else if (!mi) why = @"method not found";
+            else ok = H.vt ? PatchVT(H.tag, k, mi, H.rva, H.rep, &why) : PatchMI(H.tag, mi, H.rva, H.rep, &why);
+            if (ok) { H.done = true; Log([NSString stringWithFormat:@"patched %s (попытка %d)", H.tag, g_attempt]); }
+            else { left++; if (g_attempt % 6 == 1) Log([NSString stringWithFormat:@"%s: %@", H.tag, why]); }
+        }
+        if (!left) { Log(@"все патчи установлены"); return; }
+    }
+again:
+    if (g_attempt < 60)   // классы инициализируются по мере захода в матч - повторяем каждые 5 секунд
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{ TryInstall(); });
+    else Log(@"патчи установлены не полностью, см. строки выше");
+}
+
+__attribute__((constructor)) static void Entry() {
+    LoadSkip();
+    Log([NSString stringWithFormat:@"=== build %s %s (v3: FindClass по всем сборкам, DumpDiag) ===", __DATE__, __TIME__]);
+    MenuInit();   // само откладывает показ окна на 5 секунд
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 8 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{ TryInstall(); });
 }
